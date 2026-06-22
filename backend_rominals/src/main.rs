@@ -45,6 +45,51 @@ fn money(v: Option<f64>) -> String {
     }
 }
 
+fn display_meta(meta: &Meta) -> String {
+    let (change, pct) = match (meta.regular_market_price, meta.chart_previous_close) {
+        (Some(price), Some(prev_close)) if prev_close != 0.0 => {
+            let delta = price - prev_close;
+            (Some(delta), Some(delta / prev_close * 100.0))
+        }
+        _ => (None, None),
+    };
+
+    let name = meta
+        .long_name
+        .as_deref()
+        .or(meta.short_name.as_deref())
+        .unwrap_or(&meta.symbol);
+
+    let change_text = match (change, pct) {
+        (Some(delta), Some(percent)) => {
+            let sign = if delta >= 0.0 { "+" } else { "" };
+            format!("{sign}{delta:.2} ({sign}{percent:.2}%)")
+        }
+        _ => "n/a".to_string(),
+    };
+
+    let volume = meta
+        .regular_market_volume
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+
+    format!(
+        "{} ({})\n  Exchange:       {}\n  Currency:       {}\n  Price:          {}\n  Change:         {}\n  Prev close:     {}\n  Day range:      {} - {}\n  52-week range:  {} - {}\n  Volume:         {}",
+        name,
+        meta.symbol,
+        meta.full_exchange_name.as_deref().unwrap_or("n/a"),
+        meta.currency.as_deref().unwrap_or("n/a"),
+        money(meta.regular_market_price),
+        change_text,
+        money(meta.chart_previous_close),
+        money(meta.regular_market_day_low),
+        money(meta.regular_market_day_high),
+        money(meta.fifty_two_week_low),
+        money(meta.fifty_two_week_high),
+        volume,
+    )
+}
+
 // ----- Entry point ----------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -83,12 +128,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => return Err("No data — is that a valid ticker?".into()),
     };
 
-    let (change, pct) = match (meta.regular_market_price, meta.chart_previous_close) {
-        (Some(p), Some(prev)) if prev != 0.0 => (Some(p - prev), Some((p - prev) / prev * 100.0)),
-        _ => (None, None),
-    };
-
-    println!("{:#?}", meta);
+    println!("{}", display_meta(&meta));
 
     Ok(())
 }
