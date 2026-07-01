@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use std::env;
 use std::error::Error;
-
+use std::io;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct ChartResponse {
@@ -11,11 +12,18 @@ struct ChartResponse {
 #[derive(Debug, Deserialize)]
 struct Chart {
     result: Option<Vec<ChartResult>>,
+    error: Option<ChartApiError>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChartResult {
     meta: Meta,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartApiError {
+    code: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,9 +55,9 @@ fn money(v: Option<f64>) -> String {
 
 fn display_meta(meta: &Meta) -> String {
     let (change, pct) = match (meta.regular_market_price, meta.chart_previous_close) {
-        (Some(price), Some(prev_close)) if prev_close != 0.0 => {
-            let delta = price - prev_close;
-            (Some(delta), Some(delta / prev_close * 100.0))
+        (Some(price), Some(previous_close)) if previous_close != 0.0 => {
+            let delta = price - previous_close;
+            (Some(delta), Some(delta / previous_close * 100.0))
         }
         _ => (None, None),
     };
@@ -90,45 +98,152 @@ fn display_meta(meta: &Meta) -> String {
     )
 }
 
+fn usage_message(binary: &str) -> String {
+    format!("Usage: {binary} <TICKER>   (e.g. AAPL, MSFT, KRKNF)")
+}
+
+fn parse_ticker_from_args<I>(args: I) -> Result<String, io::Error>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let binary = args.next().unwrap_or_else(|| "cargo run --".to_string());
+    let ticker = args.next();
+    let has_extra_args = args.next().is_some();
+
+    match (ticker, has_extra_args) {
+        (Some(raw_ticker), false) if !raw_ticker.trim().is_empty() => Ok(raw_ticker.to_uppercase()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            usage_message(&binary),
+        )),
+    }
+}
+
+fn extract_meta(body: ChartResponse, ticker: &str) -> Result<Meta, io::Error> {
+    let Chart { result, error } = body.chart;
+
+    if let Some(api_error) = error {
+        let code = api_error.code.unwrap_or_else(|| "unknown".to_string());
+        let description = api_error
+            .description
+            .unwrap_or_else(|| "No description provided".to_string());
+        return Err(io::Error::other(format!(
+            "Yahoo API error for {ticker} [{code}]: {description}"
+        )));
+    }
+
+    let first_result = result
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Yahoo response did not include quote results for {ticker}"),
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Yahoo returned an empty result list for {ticker}"),
+            )
+        })?;
+
+    Ok(first_result.meta)
+}
+
 // ----- Entry point ----------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
+    let ticker = parse_ticker_from_args(env::args())?;
 
-    if args.len() != 2 {
-        eprintln!("Usage: cargo run -- <TICKER>   (e.g. AAPL, MSFT, KRKNF)");
-        std::process::exit(2);
-    }
-
-    let ticker = args[1].to_uppercase();
-
-    let url = format!(
-        "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    );
+    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{ticker}");
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (rust-yfinance/0.1)")
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
         .build()?;
 
     let resp = client.get(&url).send()?;
 
     if !resp.status().is_success() {
-        return Err(format!("HTTP {} from Yahoo", resp.status()).into());
+        let status = resp.status();
+        let error_body = resp
+            .text()
+            .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
+        return Err(io::Error::other(format!(
+            "HTTP {status} from Yahoo for {ticker}: {error_body}"
+        ))
+        .into());
     }
 
     println!("Fetching quote for {}...", ticker);
 
     let body: ChartResponse = resp.json()?;
-
-    let meta = match body.chart.result {
-        Some(mut results_vec) => match results_vec.pop() {
-            Some(results_item) => results_item.meta,
-            None => return Err("No data — is that a valid ticker?".into()),
-        },
-        None => return Err("No data — is that a valid ticker?".into()),
-    };
+    let meta = extract_meta(body, &ticker)?;
 
     println!("{}", display_meta(&meta));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_meta() -> Meta {
+        Meta {
+            symbol: "AAPL".to_string(),
+            currency: Some("USD".to_string()),
+            full_exchange_name: Some("NasdaqGS".to_string()),
+            long_name: Some("Apple Inc.".to_string()),
+            short_name: Some("Apple".to_string()),
+            regular_market_price: Some(100.0),
+            chart_previous_close: Some(95.0),
+            regular_market_day_high: Some(101.0),
+            regular_market_day_low: Some(94.5),
+            regular_market_volume: Some(123456789),
+            fifty_two_week_high: Some(200.0),
+            fifty_two_week_low: Some(80.0),
+        }
+    }
+
+    #[test]
+    fn money_formats_option_values() {
+        assert_eq!(money(Some(123.456)), "123.46");
+        assert_eq!(money(None), "n/a");
+    }
+
+    #[test]
+    fn parse_ticker_requires_exactly_one_non_empty_arg() {
+        let args = vec!["backend_rominals".to_string(), "msft".to_string()];
+        assert_eq!(parse_ticker_from_args(args).unwrap(), "MSFT");
+
+        let missing_ticker = vec!["backend_rominals".to_string()];
+        assert!(parse_ticker_from_args(missing_ticker).is_err());
+
+        let too_many_args = vec![
+            "backend_rominals".to_string(),
+            "AAPL".to_string(),
+            "EXTRA".to_string(),
+        ];
+        assert!(parse_ticker_from_args(too_many_args).is_err());
+    }
+
+    #[test]
+    fn display_meta_formats_change_and_name() {
+        let output = display_meta(&sample_meta());
+        assert!(output.contains("Apple Inc. (AAPL)"));
+        assert!(output.contains("Change:         +5.00 (+5.26%)"));
+    }
+
+    #[test]
+    fn display_meta_hides_change_when_previous_close_is_zero() {
+        let mut meta = sample_meta();
+        meta.chart_previous_close = Some(0.0);
+
+        let output = display_meta(&meta);
+        assert!(output.contains("Change:         n/a"));
+    }
 }
