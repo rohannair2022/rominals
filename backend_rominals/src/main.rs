@@ -1,47 +1,9 @@
-use serde::Deserialize;
+mod api;
+
+use api::yahoo::{Meta, fetch_quote};
 use std::env;
 use std::error::Error;
 use std::io;
-use std::time::Duration;
-
-#[derive(Debug, Deserialize)]
-struct ChartResponse {
-    chart: Chart,
-}
-
-#[derive(Debug, Deserialize)]
-struct Chart {
-    result: Option<Vec<ChartResult>>,
-    error: Option<ChartApiError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartResult {
-    meta: Meta,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChartApiError {
-    code: Option<String>,
-    description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Meta {
-    symbol: String,
-    currency: Option<String>,
-    full_exchange_name: Option<String>,
-    long_name: Option<String>,
-    short_name: Option<String>,
-    regular_market_price: Option<f64>,
-    chart_previous_close: Option<f64>,
-    regular_market_day_high: Option<f64>,
-    regular_market_day_low: Option<f64>,
-    regular_market_volume: Option<i64>,
-    fifty_two_week_high: Option<f64>,
-    fifty_two_week_low: Option<f64>,
-}
 
 // ----- Helpers --------------------------------------------------------------
 
@@ -120,69 +82,13 @@ where
     }
 }
 
-fn extract_meta(body: ChartResponse, ticker: &str) -> Result<Meta, io::Error> {
-    let Chart { result, error } = body.chart;
-
-    if let Some(api_error) = error {
-        let code = api_error.code.unwrap_or_else(|| "unknown".to_string());
-        let description = api_error
-            .description
-            .unwrap_or_else(|| "No description provided".to_string());
-        return Err(io::Error::other(format!(
-            "Yahoo API error for {ticker} [{code}]: {description}"
-        )));
-    }
-
-    let first_result = result
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Yahoo response did not include quote results for {ticker}"),
-            )
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Yahoo returned an empty result list for {ticker}"),
-            )
-        })?;
-
-    Ok(first_result.meta)
-}
-
 // ----- Entry point ----------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn Error>> {
     let ticker = parse_ticker_from_args(env::args())?;
-
-    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{ticker}");
-
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (rust-yfinance/0.1)")
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
-        .build()?;
-
-    let resp = client.get(&url).send()?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let error_body = resp
-            .text()
-            .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
-        return Err(io::Error::other(format!(
-            "HTTP {status} from Yahoo for {ticker}: {error_body}"
-        ))
-        .into());
-    }
+    let meta = fetch_quote(&ticker)?;
 
     println!("Fetching quote for {}...", ticker);
-
-    let body: ChartResponse = resp.json()?;
-    let meta = extract_meta(body, &ticker)?;
-
     println!("{}", display_meta(&meta));
 
     Ok(())
