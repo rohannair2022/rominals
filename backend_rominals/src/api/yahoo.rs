@@ -25,7 +25,7 @@ struct ChartApiError {
     description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Meta {
     pub symbol: String,
@@ -108,18 +108,16 @@ mod tests {
     fn sample_meta(symbol: &str) -> Meta {
         Meta {
             symbol: symbol.to_string(),
-            currency: None,
-            full_exchange_name: None,
-            long_name: None,
-            short_name: None,
-            regular_market_price: None,
-            chart_previous_close: None,
-            regular_market_day_high: None,
-            regular_market_day_low: None,
-            regular_market_volume: None,
-            fifty_two_week_high: None,
-            fifty_two_week_low: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn meta_default_sets_empty_symbol_and_none_optionals() {
+        let meta = Meta::default();
+        assert_eq!(meta.symbol, "");
+        assert!(meta.long_name.is_none());
+        assert!(meta.regular_market_price.is_none());
     }
 
     #[test]

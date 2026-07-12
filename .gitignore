@@ -26,16 +26,6 @@ htmlcov/
 **/target/
 Cargo.lock
 
-# Frontend (Next.js)
-frontend_rominals/node_modules/
-frontend_rominals/.next/
-frontend_rominals/out/
-frontend_rominals/build/
-frontend_rominals/coverage/
-frontend_rominals/.vercel/
-frontend_rominals/next-env.d.ts
-frontend_rominals/*.tsbuildinfo
-
 # Logs
 *.log
 
