@@ -1,8 +1,7 @@
 use super::state::App;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 
-const INVALID_TICKER_ERROR: &str =
-    "Ticker can only include letters, numbers, '.', '-', and '^'.";
+const INVALID_TICKER_ERROR: &str = "Ticker can only include letters, numbers, '.', '-', and '^'.";
 
 fn is_valid_ticker_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^')

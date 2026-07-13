@@ -7,6 +7,8 @@ use crossterm::cursor;
 use crossterm::event::{self};
 use crossterm::execute;
 use crossterm::terminal;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use state::App;
 use std::error::Error;
 use std::io;
@@ -31,6 +33,8 @@ pub(crate) fn run_tui(initial_ticker: Option<String>) -> Result<(), Box<dyn Erro
 
     terminal::enable_raw_mode()?;
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
     let run_result = (|| -> Result<(), Box<dyn Error>> {
         let mut app = App::default();
@@ -40,7 +44,7 @@ pub(crate) fn run_tui(initial_ticker: Option<String>) -> Result<(), Box<dyn Erro
         }
 
         loop {
-            draw_ui(&mut stdout, &app)?;
+            terminal.draw(|frame| draw_ui(frame, &app))?;
 
             if !event::poll(Duration::from_millis(250))? {
                 continue;
@@ -56,8 +60,13 @@ pub(crate) fn run_tui(initial_ticker: Option<String>) -> Result<(), Box<dyn Erro
     })();
 
     let cleanup_result = (|| -> io::Result<()> {
-        execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        )?;
+        terminal.show_cursor()?;
         Ok(())
     })();
 
