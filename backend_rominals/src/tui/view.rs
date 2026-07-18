@@ -106,16 +106,42 @@ fn quote_rows(meta: &Meta) -> Vec<Row<'static>> {
     rows
 }
 
+fn wrapped_line_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+
+    text.lines().fold(0u16, |acc, line| {
+        let chars = line.chars().count() as u16;
+        let wrapped = (chars / width).saturating_add(1);
+        acc.saturating_add(wrapped)
+    })
+}
+
+fn analysis_max_scroll(analysis: &str, panel_width: u16, panel_height: u16) -> u16 {
+    let inner_width = panel_width.saturating_sub(2).max(1);
+    let visible_lines = panel_height.saturating_sub(2);
+    if visible_lines == 0 {
+        return 0;
+    }
+
+    wrapped_line_count(analysis, inner_width).saturating_sub(visible_lines)
+}
+
 pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
-    let chunks = Layout::default()
+    let outer_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(4),
-            Constraint::Min(8),
+            Constraint::Min(12),
             Constraint::Length(3),
         ])
         .split(frame.area());
+    let content_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(outer_chunks[2]);
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -124,13 +150,25 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  |  Enter fetch  r refresh  q quit"),
+        Span::raw("  |  Enter fetch  Ctrl+R refresh  ↑/↓ scroll analysis  Esc quit"),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
-    frame.render_widget(header, chunks[0]);
+    frame.render_widget(header, outer_chunks[0]);
 
     let input = Paragraph::new(vec![
-        Line::from(format!("Ticker input: {}", app.input)),
+        Line::from(vec![
+            Span::raw("Ticker input: "),
+            Span::styled(
+                app.input.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if app.input_cursor_visible { "│" } else { " " },
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::from(format!(
             "Current symbol: {}",
             app.active_ticker.as_deref().unwrap_or("n/a")
@@ -138,7 +176,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     ])
     .block(Block::default().borders(Borders::ALL).title("Input"))
     .wrap(Wrap { trim: true });
-    frame.render_widget(input, chunks[1]);
+    frame.render_widget(input, outer_chunks[1]);
 
     if let Some(meta) = &app.quote {
         let quote = Table::new(
@@ -151,29 +189,76 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .borders(Borders::ALL)
                 .title(format!("Quote — {}", display_name(meta))),
         );
-        frame.render_widget(quote, chunks[2]);
+        frame.render_widget(quote, content_chunks[0]);
     } else {
         let placeholder = Paragraph::new("No quote loaded yet. Enter a ticker and press Enter.")
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL).title("Quote"))
             .wrap(Wrap { trim: true });
-        frame.render_widget(placeholder, chunks[2]);
+        frame.render_widget(placeholder, content_chunks[0]);
     }
 
-    let status = match &app.error {
-        Some(error) => Paragraph::new(Line::from(vec![
+    let analysis_title = match &app.comparison_ticker {
+        Some(comp) => format!("Ollama Analysis (vs {comp})"),
+        None => "Ollama Analysis".to_string(),
+    };
+
+    if app.analysis_loading {
+        let loading_panel = Paragraph::new("Running Ollama analysis...")
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title(analysis_title))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(loading_panel, content_chunks[1]);
+    } else if let Some(analysis) = &app.analysis {
+        let max_scroll =
+            analysis_max_scroll(analysis, content_chunks[1].width, content_chunks[1].height);
+        let scroll = app.analysis_scroll.min(max_scroll);
+        let title = format!("{analysis_title} (scroll {scroll}/{max_scroll})");
+        let analysis_panel = Paragraph::new(analysis.clone())
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(analysis_panel, content_chunks[1]);
+    } else if let Some(analysis_error) = &app.analysis_error {
+        let analysis_panel = Paragraph::new(Line::from(vec![
             Span::styled(
-                "Error: ",
+                "Analysis error: ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(error),
+            Span::raw(analysis_error),
         ]))
-        .block(Block::default().borders(Borders::ALL).title("Status")),
-        None => Paragraph::new("Ready.")
-            .style(Style::default().fg(Color::Green))
+        .block(Block::default().borders(Borders::ALL).title(analysis_title))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(analysis_panel, content_chunks[1]);
+    } else {
+        let analysis_placeholder =
+            Paragraph::new("No analysis loaded yet. Fetch a ticker to generate one.")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().borders(Borders::ALL).title(analysis_title))
+                .wrap(Wrap { trim: true });
+        frame.render_widget(analysis_placeholder, content_chunks[1]);
+    }
+
+    let status = if app.analysis_loading {
+        Paragraph::new("Fetching quote + analysis...")
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title("Status"))
+    } else {
+        match &app.error {
+            Some(error) => Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Error: ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(error),
+            ]))
             .block(Block::default().borders(Borders::ALL).title("Status")),
+            None => Paragraph::new("Ready.")
+                .style(Style::default().fg(Color::Green))
+                .block(Block::default().borders(Borders::ALL).title("Status")),
+        }
     };
-    frame.render_widget(status, chunks[3]);
+    frame.render_widget(status, outer_chunks[3]);
 }
 
 #[cfg(test)]
