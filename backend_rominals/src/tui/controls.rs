@@ -1,4 +1,4 @@
-use super::state::App;
+use super::state::{App, AppTab};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 const INVALID_TICKER_ERROR: &str = "Ticker can only include letters, numbers, '.', '-', and '^'.";
@@ -50,31 +50,100 @@ where
         (KeyCode::Enter, _) => {
             if let Some(ticker) = normalize_ticker(&app.input) {
                 app.input.clear();
-                app.analysis_scroll = 0;
+                app.alpha_scroll = 0;
+                app.ollama_scroll = 0;
                 fetch_quote(app, &ticker);
             } else {
                 app.error = Some(INVALID_TICKER_ERROR.to_string());
             }
             true
         }
+        (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.prev_tab();
+            true
+        }
+        (KeyCode::BackTab, _) => {
+            app.prev_tab();
+            true
+        }
+        (KeyCode::Tab, _) => {
+            app.next_tab();
+            true
+        }
+        (KeyCode::Left, _) => {
+            app.prev_tab();
+            true
+        }
+        (KeyCode::Right, _) => {
+            app.next_tab();
+            true
+        }
+        (KeyCode::F(1), _) => {
+            app.set_tab_index(0);
+            true
+        }
+        (KeyCode::F(2), _) => {
+            app.set_tab_index(1);
+            true
+        }
+        (KeyCode::F(3), _) => {
+            app.set_tab_index(2);
+            true
+        }
         (KeyCode::Up, _) => {
-            app.analysis_scroll = app.analysis_scroll.saturating_sub(1);
+            match app.active_tab {
+                AppTab::AlphaVantage => {
+                    app.alpha_scroll = app.alpha_scroll.saturating_sub(1);
+                }
+                AppTab::Ollama => {
+                    app.ollama_scroll = app.ollama_scroll.saturating_sub(1);
+                }
+                AppTab::Yahoo => {}
+            }
             true
         }
         (KeyCode::Down, _) => {
-            app.analysis_scroll = app.analysis_scroll.saturating_add(1);
+            match app.active_tab {
+                AppTab::AlphaVantage => {
+                    app.alpha_scroll = app.alpha_scroll.saturating_add(1);
+                }
+                AppTab::Ollama => {
+                    app.ollama_scroll = app.ollama_scroll.saturating_add(1);
+                }
+                AppTab::Yahoo => {}
+            }
             true
         }
         (KeyCode::PageUp, _) => {
-            app.analysis_scroll = app.analysis_scroll.saturating_sub(8);
+            match app.active_tab {
+                AppTab::AlphaVantage => {
+                    app.alpha_scroll = app.alpha_scroll.saturating_sub(8);
+                }
+                AppTab::Ollama => {
+                    app.ollama_scroll = app.ollama_scroll.saturating_sub(8);
+                }
+                AppTab::Yahoo => {}
+            }
             true
         }
         (KeyCode::PageDown, _) => {
-            app.analysis_scroll = app.analysis_scroll.saturating_add(8);
+            match app.active_tab {
+                AppTab::AlphaVantage => {
+                    app.alpha_scroll = app.alpha_scroll.saturating_add(8);
+                }
+                AppTab::Ollama => {
+                    app.ollama_scroll = app.ollama_scroll.saturating_add(8);
+                }
+                AppTab::Yahoo => {}
+            }
             true
         }
         (KeyCode::Home, _) => {
-            app.analysis_scroll = 0;
+            match app.active_tab {
+                AppTab::AlphaVantage => app.alpha_scroll = 0,
+                AppTab::Ollama => app.ollama_scroll = 0,
+                AppTab::Yahoo => {}
+            }
             true
         }
         (KeyCode::Backspace, _) => {
@@ -161,14 +230,31 @@ mod tests {
     #[test]
     fn handle_event_scrolls_analysis_panel_with_arrow_keys() {
         let mut app = App::default();
-        app.analysis_scroll = 2;
+        app.active_tab = AppTab::Ollama;
+        app.ollama_scroll = 2;
 
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let up = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         assert!(handle_event(&mut app, down, |_app, _ticker| {}));
-        assert_eq!(app.analysis_scroll, 3);
+        assert_eq!(app.ollama_scroll, 3);
         assert!(handle_event(&mut app, up, |_app, _ticker| {}));
-        assert_eq!(app.analysis_scroll, 2);
+        assert_eq!(app.ollama_scroll, 2);
+    }
+
+    #[test]
+    fn handle_event_switches_tabs() {
+        let mut app = App::default();
+
+        let right = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let f2 = Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(handle_event(&mut app, right, |_app, _ticker| {}));
+        assert_eq!(app.active_tab, AppTab::AlphaVantage);
+        assert!(handle_event(&mut app, f2, |_app, _ticker| {}));
+        assert_eq!(app.active_tab, AppTab::AlphaVantage);
+        assert!(handle_event(&mut app, tab, |_app, _ticker| {}));
+        assert_eq!(app.active_tab, AppTab::Ollama);
     }
 }

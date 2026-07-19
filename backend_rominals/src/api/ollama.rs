@@ -1,10 +1,39 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io::{self, BufRead, BufReader};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 const DEFAULT_OLLAMA_HOST: &str = "http://127.0.0.1:11434";
 const DEFAULT_OLLAMA_MODEL: &str = "gpt-oss:120b-cloud";
+
+const SECTION_DEFS: [(&str, &str); 6] = [
+    (
+        "TAM / Market",
+        "Target market, growth rate, and share-taker vs tide-rider framing.",
+    ),
+    (
+        "Relative Valuation",
+        "P/S, P/E or EV/EBITDA, PEG, and direct comp comparison with valuation rationale.",
+    ),
+    (
+        "Fundamentals",
+        "Revenue/margin trajectory, FCF, SBC dilution pressure, and balance-sheet quality.",
+    ),
+    (
+        "Catalysts + Macro",
+        "Near-term catalysts plus macro/geopolitical factors that specifically impact this name.",
+    ),
+    (
+        "Risks + Competitors",
+        "Concentrated downside risks, market share map, and moat durability check.",
+    ),
+    (
+        "Technicals + Entry",
+        "Trend vs key moving averages, relative strength framing, and preferred entry discipline.",
+    ),
+];
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
@@ -46,6 +75,8 @@ struct ResponseMessage {
     #[serde(default)]
     content: String,
     #[serde(default)]
+    thinking: String,
+    #[serde(default)]
     tool_calls: Vec<ToolCall>,
 }
 
@@ -57,12 +88,17 @@ struct ToolCall {
 
 struct StreamOutcome {
     content: String,
-    saw_tool_calls: bool,
+}
+
+struct WorkerResult {
+    index: usize,
+    output: Result<String, String>,
 }
 
 pub fn analyze_company_streaming<F>(
     ticker: &str,
     comparison_ticker: Option<&str>,
+    alpha_vantage_context: Option<&str>,
     mut on_partial: F,
 ) -> Result<String, Box<dyn Error>>
 where
@@ -72,36 +108,224 @@ where
         std::env::var("ROMINALS_OLLAMA_HOST").unwrap_or_else(|_| DEFAULT_OLLAMA_HOST.to_string());
     let model =
         std::env::var("ROMINALS_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
-    let prompt = build_analysis_prompt(ticker, comparison_ticker);
     let url = format!("{}/api/chat", host.trim_end_matches('/'));
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("rominals-ollama/0.1")
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(5))
         .build()?;
 
-    let first_stream = stream_chat_request(&client, &url, &model, &prompt, true, |formatted| {
-        on_partial(formatted);
+    on_partial("Running parallel research workers...\n");
+    let section_outputs = run_parallel_workers(
+        &client,
+        &url,
+        &model,
+        ticker,
+        comparison_ticker,
+        alpha_vantage_context,
+        |status| {
+            on_partial(status);
+        },
+    )?;
+
+    on_partial("Workers complete. Streaming final consolidated thesis...\n");
+    let synthesis_prompt = build_synthesis_prompt(
+        ticker,
+        comparison_ticker,
+        alpha_vantage_context,
+        &section_outputs,
+    );
+
+    let stream = stream_chat_request(&client, &url, &model, &synthesis_prompt, true, |chunk| {
+        on_partial(chunk);
     })?;
 
-    if !first_stream.content.is_empty() {
-        return Ok(first_stream.content);
+    if !stream.content.is_empty() {
+        return Ok(stream.content);
     }
 
-    if first_stream.saw_tool_calls {
-        let fallback_prompt = format!(
-            "{prompt}\nIf web-search tools are unavailable, still respond directly with your best current analysis."
+    let fallback = run_chat_with_fallback(&client, &url, &model, &synthesis_prompt)?;
+    if !fallback.is_empty() {
+        on_partial(&fallback);
+        return Ok(fallback);
+    }
+
+    Err(io::Error::other("Ollama returned an empty final thesis").into())
+}
+
+fn run_parallel_workers<F>(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    model: &str,
+    ticker: &str,
+    comparison_ticker: Option<&str>,
+    alpha_vantage_context: Option<&str>,
+    mut on_status: F,
+) -> Result<Vec<(String, String)>, Box<dyn Error>>
+where
+    F: FnMut(&str),
+{
+    let (tx, rx) = mpsc::channel::<WorkerResult>();
+
+    for (index, (title, objective)) in SECTION_DEFS.iter().enumerate() {
+        let tx = tx.clone();
+        let worker_prompt = build_section_prompt(
+            ticker,
+            comparison_ticker,
+            alpha_vantage_context,
+            title,
+            objective,
         );
-        let fallback_response = send_chat_request(&client, &url, &model, &fallback_prompt, false)?;
-        let fallback_content = format_analysis_text(&fallback_response.content);
-        if !fallback_content.is_empty() {
-            on_partial(&fallback_content);
-            return Ok(fallback_content);
+        let client = client.clone();
+        let url = url.to_string();
+        let model = model.to_string();
+
+        thread::spawn(move || {
+            let output = run_chat_with_fallback(&client, &url, &model, &worker_prompt)
+                .map_err(|err| err.to_string());
+
+            let _ = tx.send(WorkerResult { index, output });
+        });
+    }
+    drop(tx);
+
+    let mut completed = 0usize;
+    let mut results: Vec<Option<String>> = vec![None; SECTION_DEFS.len()];
+    while completed < SECTION_DEFS.len() {
+        let worker_result = rx.recv().map_err(|err| {
+            io::Error::other(format!("Worker channel closed unexpectedly: {err}"))
+        })?;
+
+        completed = completed.saturating_add(1);
+        let rendered = match worker_result.output {
+            Ok(text) => text,
+            Err(err) => format!("Section failed: {err}"),
+        };
+        results[worker_result.index] = Some(rendered);
+
+        on_status(&format_worker_status(completed, &results));
+    }
+
+    let final_sections = results
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let title = SECTION_DEFS[index].0.to_string();
+            let text = text.unwrap_or_else(|| "Section did not return output.".to_string());
+            (title, text)
+        })
+        .collect();
+
+    Ok(final_sections)
+}
+
+fn format_worker_status(completed: usize, results: &[Option<String>]) -> String {
+    let mut status = format!(
+        "Parallel worker progress: {completed}/{}\n",
+        SECTION_DEFS.len()
+    );
+
+    for (index, (title, _)) in SECTION_DEFS.iter().enumerate() {
+        let marker = if results[index].is_some() { 'x' } else { ' ' };
+        status.push_str(&format!("[{marker}] {title}\n"));
+    }
+
+    status
+}
+
+fn build_section_prompt(
+    ticker: &str,
+    comparison_ticker: Option<&str>,
+    alpha_vantage_context: Option<&str>,
+    section_title: &str,
+    objective: &str,
+) -> String {
+    let comparison_text = comparison_ticker
+        .map(|comp| format!("Compare against {comp} where relevant."))
+        .unwrap_or_default();
+    let data_context = alpha_vantage_context
+        .unwrap_or("Alpha Vantage context unavailable for this run. Use web search as needed.");
+
+    format!(
+        "You are one worker in a parallel investment research pipeline.\n\
+Ticker: {ticker}\n\
+{comparison_text}\n\
+Worker scope: {section_title}\n\
+Objective: {objective}\n\
+Rules: concise, data-dense, plain text only, no markdown, no filler.\n\
+Use the context below first and web search only when needed to refresh stale metrics.\n\
+\n\
+Context:\n{data_context}\n\
+\n\
+Return only this section, with 4-8 bullet-like lines in plain text."
+    )
+}
+
+fn build_synthesis_prompt(
+    ticker: &str,
+    comparison_ticker: Option<&str>,
+    alpha_vantage_context: Option<&str>,
+    sections: &[(String, String)],
+) -> String {
+    let subject = match comparison_ticker {
+        Some(comp) => format!("{ticker} vs. comp {comp}"),
+        None => ticker.to_string(),
+    };
+    let data_context = alpha_vantage_context.unwrap_or("Alpha Vantage context unavailable.");
+
+    let mut section_block = String::new();
+    for (title, text) in sections {
+        section_block.push_str(&format!("{title}\n{text}\n\n"));
+    }
+
+    format!(
+        "Analyze {subject} as a potential long. Be concise, data-dense, no filler. \
+Use current numbers (search if needed) and prioritize the structured context below. \
+Return plain text only (no markdown syntax such as **, //, #, or backticks).\n\
+\n\
+Alpha Vantage context:\n{data_context}\n\
+\n\
+Parallel worker outputs:\n{section_block}\n\
+\n\
+Final required structure:\n\
+TAM/Market\n\
+Relative Valuation\n\
+Fundamentals\n\
+Catalysts\n\
+Macro\n\
+Risks\n\
+Technicals (brief)\n\
+Competitors\n\
+Alpha / What's Mispriced\n\
+Verdict: Long / No / Watch-list, with strongest reason and what changes your mind."
+    )
+}
+
+fn run_chat_with_fallback(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String, Box<dyn Error>> {
+    let first = send_chat_request(client, url, model, prompt, true)?;
+    let first_content = format_analysis_text(&first.content);
+    if !first_content.is_empty() {
+        return Ok(first_content);
+    }
+
+    if !first.tool_calls.is_empty() {
+        let fallback_prompt = format!(
+            "{prompt}\nIf external tools are unavailable, respond directly with your best synthesis."
+        );
+        let second = send_chat_request(client, url, model, &fallback_prompt, false)?;
+        let second_content = format_analysis_text(&second.content);
+        if !second_content.is_empty() {
+            return Ok(second_content);
         }
     }
 
-    Err(io::Error::other("Ollama returned an empty analysis response").into())
+    Err(io::Error::other("Ollama worker returned empty content").into())
 }
 
 fn stream_chat_request<F>(
@@ -143,7 +367,9 @@ where
 
     let mut saw_tool_calls = false;
     let mut raw_output = String::new();
+    let mut raw_thinking = String::new();
     let reader = BufReader::new(resp);
+
     for line in reader.lines() {
         let line = line?;
         let line = line.trim();
@@ -166,12 +392,22 @@ where
                 saw_tool_calls = true;
             }
 
+            if !message.thinking.is_empty() {
+                raw_thinking.push_str(&message.thinking);
+            }
+
             if !message.content.is_empty() {
                 raw_output.push_str(&message.content);
                 let formatted = format_analysis_text(&raw_output);
                 if !formatted.is_empty() {
                     on_partial(&formatted);
                 }
+            } else if raw_output.is_empty() && !raw_thinking.is_empty() {
+                let staged = format!(
+                    "Streaming model reasoning...\n\n{}",
+                    format_analysis_text(&raw_thinking)
+                );
+                on_partial(&staged);
             }
         }
 
@@ -180,10 +416,14 @@ where
         }
     }
 
-    Ok(StreamOutcome {
-        content: format_analysis_text(&raw_output),
-        saw_tool_calls,
-    })
+    let content = if raw_output.is_empty() {
+        format_analysis_text(&raw_thinking)
+    } else {
+        format_analysis_text(&raw_output)
+    };
+
+    let _ = saw_tool_calls;
+    Ok(StreamOutcome { content })
 }
 
 fn send_chat_request(
@@ -280,48 +520,23 @@ fn format_analysis_text(raw: &str) -> String {
     output.trim().to_string()
 }
 
-fn build_analysis_prompt(ticker: &str, comparison_ticker: Option<&str>) -> String {
-    let subject = match comparison_ticker {
-        Some(comp) => format!("{ticker} vs. comp {comp}"),
-        None => ticker.to_string(),
-    };
-
-    format!(
-        "Analyze {subject} as a potential long. Be concise, data-dense, no filler. \
-Use current numbers (search if needed) - don't rely on stale memory for financials. \
-Return plain text only (no markdown syntax such as **, //, #, or backticks). \
-Structure: TAM/Market - What market(s) is this actually selling into (e.g. fintech, AI infra, defense)? \
-Size + growth rate. Is the company a share-taker or riding the tide? \
-Relative Valuation - P/S, P/E (or EV/EBITDA if unprofitable), PEG vs. 1-2 direct comps. \
-Is it cheap/expensive and why (growth premium, moat, hype)? \
-Fundamentals - Revenue growth (YoY/QoQ), gross margin trend, path to profitability or current margins, \
-FCF, SBC as % of revenue (dilution drag), balance sheet health (cash vs. debt). \
-Catalysts - Near-term (next 1-2 quarters: earnings, product launches, conferences) and structural \
-(TAM expansion, new verticals, contracts). Macro - Rate cuts/hikes, geopolitical tailwinds (war, trade, reshoring), \
-sector rotation - how does this name specifically benefit or get hurt? Risks - Dilution risk, \
-convertible notes/debt maturities, customer concentration, regulatory, competitive threat, valuation risk if multiple compresses. \
-Technicals (brief) - Trend vs. key MAs, relative strength vs. sector, is this a good entry now or \
-does it need to cool off / pull back to a level? Competitors - Market share map, who's winning share and why, \
-moat durability (patents, switching costs, capex lead). Alpha / What's Mispriced - The one thing the market isn't \
-pricing in yet (bull or bear). This is the actual edge - everything above is just groundwork for this. \
-End with a verdict: Long / No / Watch-list, with the single strongest reason and the level or catalyst that would change your mind."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn prompt_includes_primary_ticker() {
-        let prompt = build_analysis_prompt("AAPL", None);
-        assert!(prompt.starts_with("Analyze AAPL as a potential long."));
+    fn section_prompt_includes_ticker() {
+        let prompt = build_section_prompt("AAPL", Some("MSFT"), None, "TAM / Market", "Objective");
+        assert!(prompt.contains("Ticker: AAPL"));
+        assert!(prompt.contains("Compare against MSFT"));
     }
 
     #[test]
-    fn prompt_includes_comparison_ticker_when_present() {
-        let prompt = build_analysis_prompt("NVDA", Some("AMD"));
-        assert!(prompt.starts_with("Analyze NVDA vs. comp AMD as a potential long."));
+    fn synthesis_prompt_contains_required_sections() {
+        let sections = vec![("TAM / Market".to_string(), "Example".to_string())];
+        let prompt = build_synthesis_prompt("AAPL", None, None, &sections);
+        assert!(prompt.contains("Alpha / What's Mispriced"));
+        assert!(prompt.contains("Verdict: Long / No / Watch-list"));
     }
 
     #[test]

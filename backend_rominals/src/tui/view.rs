@@ -1,10 +1,10 @@
-use super::state::App;
+use super::state::{App, AppTab};
 use crate::api::yahoo::Meta;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 
 /// Format an Option<f64> as a price string, or "n/a" if absent.
 fn money(v: Option<f64>) -> String {
@@ -118,14 +118,104 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
     })
 }
 
-fn analysis_max_scroll(analysis: &str, panel_width: u16, panel_height: u16) -> u16 {
+fn panel_max_scroll(body: &str, panel_width: u16, panel_height: u16) -> u16 {
     let inner_width = panel_width.saturating_sub(2).max(1);
     let visible_lines = panel_height.saturating_sub(2);
     if visible_lines == 0 {
         return 0;
     }
 
-    wrapped_line_count(analysis, inner_width).saturating_sub(visible_lines)
+    wrapped_line_count(body, inner_width).saturating_sub(visible_lines)
+}
+
+fn alpha_tab_body(app: &App) -> String {
+    let fundamentals = app.alpha_fundamentals_snapshot.as_deref().unwrap_or(
+        "Alpha Fundamentals Snapshot\nNot loaded yet. Fetch a ticker to load Alpha Vantage fundamentals.",
+    );
+    let news = app.alpha_news_snapshot.as_deref().unwrap_or(
+        "Alpha News Snapshot\nNot loaded yet. Fetch a ticker to load Alpha Vantage news sentiment.",
+    );
+
+    format!("{fundamentals}\n\n{}\n\n{news}", "-".repeat(72))
+}
+
+fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    if let Some(meta) = &app.quote {
+        let quote = Table::new(
+            quote_rows(meta),
+            [Constraint::Length(18), Constraint::Min(20)],
+        )
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Yahoo — {}", display_name(meta))),
+        );
+        frame.render_widget(quote, area);
+    } else {
+        let placeholder =
+            Paragraph::new("No Yahoo quote loaded yet. Enter a ticker and press Enter.")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().borders(Borders::ALL).title("Yahoo"))
+                .wrap(Wrap { trim: true });
+        frame.render_widget(placeholder, area);
+    }
+}
+
+fn render_alpha_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let body = alpha_tab_body(app);
+    let max_scroll = panel_max_scroll(&body, area.width, area.height);
+    let scroll = app.alpha_scroll.min(max_scroll);
+    let title = format!("Alpha Vantage (scroll {scroll}/{max_scroll})");
+    let panel = Paragraph::new(body)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn render_ollama_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let title = match &app.comparison_ticker {
+        Some(comp) => format!("Ollama (vs {comp})"),
+        None => "Ollama".to_string(),
+    };
+
+    if app.analysis_loading {
+        let panel = Paragraph::new("Running Ollama analysis...")
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(panel, area);
+        return;
+    }
+
+    if let Some(analysis) = &app.analysis {
+        let max_scroll = panel_max_scroll(analysis, area.width, area.height);
+        let scroll = app.ollama_scroll.min(max_scroll);
+        let title = format!("{title} (scroll {scroll}/{max_scroll})");
+        let panel = Paragraph::new(analysis.clone())
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(panel, area);
+        return;
+    }
+
+    if let Some(analysis_error) = &app.analysis_error {
+        let panel = Paragraph::new(format!("Analysis error: {analysis_error}"))
+            .style(Style::default().fg(Color::Red))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(panel, area);
+        return;
+    }
+
+    let placeholder =
+        Paragraph::new("No Ollama analysis loaded yet. Fetch a ticker to generate one.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: true });
+    frame.render_widget(placeholder, area);
 }
 
 pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
@@ -134,14 +224,11 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(4),
-            Constraint::Min(12),
+            Constraint::Length(3),
+            Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(frame.area());
-    let content_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(outer_chunks[2]);
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -150,7 +237,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  |  Enter fetch  Ctrl+R refresh  ↑/↓ scroll analysis  Esc quit"),
+        Span::raw("  |  Enter fetch  Ctrl+R refresh  Tab/←/→/F1-F3 tabs  Esc quit"),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
     frame.render_widget(header, outer_chunks[0]);
@@ -178,65 +265,20 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     .wrap(Wrap { trim: true });
     frame.render_widget(input, outer_chunks[1]);
 
-    if let Some(meta) = &app.quote {
-        let quote = Table::new(
-            quote_rows(meta),
-            [Constraint::Length(18), Constraint::Min(20)],
+    let tabs = Tabs::new(vec!["Yahoo", "Alpha Vantage", "Ollama"])
+        .select(app.active_tab_index())
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )
-        .column_spacing(1)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Quote — {}", display_name(meta))),
-        );
-        frame.render_widget(quote, content_chunks[0]);
-    } else {
-        let placeholder = Paragraph::new("No quote loaded yet. Enter a ticker and press Enter.")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().borders(Borders::ALL).title("Quote"))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(placeholder, content_chunks[0]);
-    }
+        .block(Block::default().borders(Borders::ALL).title("Tabs"));
+    frame.render_widget(tabs, outer_chunks[2]);
 
-    let analysis_title = match &app.comparison_ticker {
-        Some(comp) => format!("Ollama Analysis (vs {comp})"),
-        None => "Ollama Analysis".to_string(),
-    };
-
-    if app.analysis_loading {
-        let loading_panel = Paragraph::new("Running Ollama analysis...")
-            .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().borders(Borders::ALL).title(analysis_title))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(loading_panel, content_chunks[1]);
-    } else if let Some(analysis) = &app.analysis {
-        let max_scroll =
-            analysis_max_scroll(analysis, content_chunks[1].width, content_chunks[1].height);
-        let scroll = app.analysis_scroll.min(max_scroll);
-        let title = format!("{analysis_title} (scroll {scroll}/{max_scroll})");
-        let analysis_panel = Paragraph::new(analysis.clone())
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(analysis_panel, content_chunks[1]);
-    } else if let Some(analysis_error) = &app.analysis_error {
-        let analysis_panel = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Analysis error: ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(analysis_error),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title(analysis_title))
-        .wrap(Wrap { trim: true });
-        frame.render_widget(analysis_panel, content_chunks[1]);
-    } else {
-        let analysis_placeholder =
-            Paragraph::new("No analysis loaded yet. Fetch a ticker to generate one.")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(Block::default().borders(Borders::ALL).title(analysis_title))
-                .wrap(Wrap { trim: true });
-        frame.render_widget(analysis_placeholder, content_chunks[1]);
+    match app.active_tab {
+        AppTab::Yahoo => render_yahoo_tab(frame, app, outer_chunks[3]),
+        AppTab::AlphaVantage => render_alpha_tab(frame, app, outer_chunks[3]),
+        AppTab::Ollama => render_ollama_tab(frame, app, outer_chunks[3]),
     }
 
     let status = if app.analysis_loading {
@@ -258,7 +300,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .block(Block::default().borders(Borders::ALL).title("Status")),
         }
     };
-    frame.render_widget(status, outer_chunks[3]);
+    frame.render_widget(status, outer_chunks[4]);
 }
 
 #[cfg(test)]
