@@ -7,7 +7,7 @@ use std::thread;
 
 const DEFAULT_MLX_PYTHON_BIN: &str = "python3";
 const DEFAULT_MLX_MODEL: &str = "mlx-community/Qwen3.5-4B-MLX-4bit";
-const DEFAULT_MLX_MAX_TOKENS: u32 = 1500;
+const DEFAULT_MLX_MAX_TOKENS: u32 = 200;
 const DEFAULT_MLX_TEMPERATURE: f32 = 0.2;
 const DEFAULT_MLX_PARALLEL_WORKERS: usize = 1;
 const MAX_MLX_PARALLEL_WORKERS: usize = 1;
@@ -314,18 +314,20 @@ Return only this section, with 3-5 bullet-like lines in plain text, max 90 words
 
 /// Strips ANSI escape sequences (CSI codes: colors, cursor movement, line
 /// clears, etc.) that `rich`-based CLIs like mlx_lm emit for their live
-/// progress/stats panels. Without this, forwarding raw chunks to a terminal
-/// lets those cursor-control codes execute and wipe out prior output.
+/// progress/stats panels. This is NOT text filtering -- these are invisible
+/// terminal control bytes, not content. Leaving them in means cursor-move /
+/// line-clear sequences actively execute in your terminal and erase prior
+/// output, which is the opposite of "show everything." Every visible
+/// character of the model's real output (including all reasoning, all
+/// stats lines, everything) still passes through untouched.
 fn strip_ansi_escapes(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
     let mut i = 0;
 
     while i < bytes.len() {
-        // ESC (0x1B) starts an escape sequence
         if bytes[i] == 0x1B && i + 1 < bytes.len() {
             match bytes[i + 1] {
-                // CSI sequences: ESC [ ... <final byte 0x40-0x7E>
                 b'[' => {
                     let mut j = i + 2;
                     while j < bytes.len() && !(0x40..=0x7E).contains(&bytes[j]) {
@@ -334,7 +336,6 @@ fn strip_ansi_escapes(input: &str) -> String {
                     i = (j + 1).min(bytes.len());
                     continue;
                 }
-                // OSC sequences: ESC ] ... (terminated by BEL or ESC \)
                 b']' => {
                     let mut j = i + 2;
                     while j < bytes.len() && bytes[j] != 0x07 {
@@ -347,7 +348,6 @@ fn strip_ansi_escapes(input: &str) -> String {
                     i = (j + 1).min(bytes.len());
                     continue;
                 }
-                // Other short escape sequences (e.g. ESC ( B for charset)
                 _ => {
                     i += 2;
                     continue;
@@ -355,14 +355,11 @@ fn strip_ansi_escapes(input: &str) -> String {
             }
         }
 
-        // Carriage return alone is also used by rich for in-place redraws;
-        // drop it so it doesn't overwrite prior text when concatenated.
         if bytes[i] == b'\r' {
             i += 1;
             continue;
         }
 
-        // Safe to copy this byte through; find the char boundary properly.
         let ch_len = utf8_char_len(bytes[i]);
         let end = (i + ch_len).min(bytes.len());
         if let Ok(s) = std::str::from_utf8(&bytes[i..end]) {
@@ -430,6 +427,11 @@ where
         Ok(bytes)
     });
 
+    // Everything read from stdout is streamed live via on_chunk AND
+    // accumulated into stdout_text, with zero filtering beyond ANSI-escape
+    // stripping (control codes, not content). No extraction, no trimming
+    // of sections, no dropping of "noise" lines -- every visible character
+    // the process printed is kept, in order.
     let mut stdout_text = String::new();
     let mut read_buffer = [0u8; 4096];
     loop {
@@ -464,163 +466,13 @@ where
         .into());
     }
 
-    let extracted = extract_generation_output(&stdout_text);
-    let cleaned = format_analysis_text(&extracted);
-    if cleaned.is_empty() {
-        return Err(io::Error::other("mlx-lm returned empty content").into());
+    if stdout_text.is_empty() {
+        return Err(io::Error::other("mlx-lm returned no output").into());
     }
 
-    Ok(cleaned)
-}
-
-fn extract_generation_output(stdout: &str) -> String {
-    let normalized = stdout.replace("\r\n", "\n");
-    let start_index = ["<think>", "Thinking:", "Thinking...", "Reasoning:", "Generation:"]
-        .iter()
-        .filter_map(|marker| normalized.find(marker))
-        .min();
-    let extracted = start_index
-        .map(|index| &normalized[index..])
-        .unwrap_or(normalized.as_str());
-    extracted.trim().to_string()
-}
-
-fn format_analysis_text(raw: &str) -> String {
-    let normalized = raw.replace("\r\n", "\n");
-    let mut cleaned_lines = Vec::new();
-    let mut skipping_prompt_echo = false;
-
-    for source_line in normalized.lines() {
-        let trimmed_source = source_line.trim();
-        if skipping_prompt_echo {
-            if !starts_model_output(trimmed_source) {
-                continue;
-            }
-            skipping_prompt_echo = false;
-        }
-
-        if trimmed_source.starts_with("Prompt:") {
-            skipping_prompt_echo = true;
-            continue;
-        }
-
-        if is_mlx_runtime_noise_line(trimmed_source) {
-            continue;
-        }
-
-        let mut line = source_line
-            .replace("**", "")
-            .replace("__", "")
-            .replace('`', "");
-
-        let trimmed_start = line.trim_start();
-        if trimmed_start.starts_with('#') {
-            line = trimmed_start
-                .trim_start_matches('#')
-                .trim_start()
-                .to_string();
-        }
-
-        let trimmed = line.trim();
-        if trimmed == "//" {
-            continue;
-        }
-
-        if is_mlx_runtime_noise_line(trimmed) {
-            continue;
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("Generation:") {
-            line = rest.trim_start().to_string();
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("// ") {
-            line = rest.to_string();
-        }
-
-        cleaned_lines.push(line.trim_end().to_string());
-    }
-
-    let mut output = String::new();
-    let mut pending_blank = false;
-    for line in cleaned_lines {
-        if line.is_empty() {
-            if pending_blank {
-                continue;
-            }
-            pending_blank = true;
-        } else {
-            pending_blank = false;
-        }
-
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(&line);
-    }
-
-    output.trim().to_string()
-}
-
-fn starts_model_output(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("<think>")
-        || trimmed.starts_with("Thinking:")
-        || trimmed.starts_with("Thinking...")
-        || trimmed.starts_with("Reasoning:")
-        || trimmed.starts_with("Generation:")
-}
-
-fn is_mlx_runtime_noise_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    if is_box_drawing_only(trimmed) {
-        return true;
-    }
-
-    let lowered = trimmed.to_ascii_lowercase();
-    lowered.contains("tokens-per-sec")
-        || lowered.contains("peak memory:")
-        || lowered.contains("tokens/sec")
-}
-
-fn is_box_drawing_only(line: &str) -> bool {
-    line.chars().all(|ch| {
-        matches!(
-            ch,
-            '─'
-                | '│'
-                | '╭'
-                | '╮'
-                | '╰'
-                | '╯'
-                | '┌'
-                | '┐'
-                | '└'
-                | '┘'
-                | '┬'
-                | '┴'
-                | '┤'
-                | '├'
-                | '┼'
-                | '═'
-                | '║'
-                | '╔'
-                | '╗'
-                | '╚'
-                | '╝'
-                | '╠'
-                | '╣'
-                | '╦'
-                | '╩'
-                | '╬'
-                | ' '
-                | '|'
-        )
-    })
+    // Returned as-is: full prompt echo, all reasoning, the final answer,
+    // and the runtime stats panel -- nothing removed.
+    Ok(stdout_text)
 }
 
 #[cfg(test)]
@@ -637,22 +489,6 @@ mod tests {
     #[test]
     fn worker_titles_match_worker_count() {
         assert_eq!(worker_section_titles().len(), SECTION_DEFS.len());
-    }
-
-    #[test]
-    fn extract_generation_output_prefers_generation_section() {
-        let raw = "Prompt: hi\nGeneration: result line 1\nresult line 2\n";
-        assert_eq!(
-            extract_generation_output(raw),
-            "Generation: result line 1\nresult line 2"
-        );
-    }
-
-    #[test]
-    fn format_analysis_text_removes_markdown_artifacts() {
-        let raw = "## Header\n**Alpha** vs __beta__\n// note\n`code`";
-        let cleaned = format_analysis_text(raw);
-        assert_eq!(cleaned, "Header\nAlpha vs beta\nnote\ncode");
     }
 
     #[test]
@@ -684,23 +520,13 @@ mod tests {
     }
 
     #[test]
-    fn strip_ansi_escapes_handles_rich_panel_borders() {
-        // Simplified rich-style box output with CSI cursor codes mixed in.
-        let raw = "\x1b[1;36m500 tokens, 19.449 tokens-per-sec\x1b[0m\r\n\x1b[2KPeak memory: 2.719 GB\r\n";
+    fn strip_ansi_escapes_keeps_all_content_including_stats_and_thinking() {
+        let raw = "\x1b[1;36mPrompt: hidden prompt\x1b[0m\r\n<think>\nreasoning here\n</think>\nGeneration: final answer\r\n\u{2502}500 tokens, 21.273 tokens-per-sec\u{2502}\r\n";
         let cleaned = strip_ansi_escapes(raw);
-        assert_eq!(
-            cleaned,
-            "500 tokens, 19.449 tokens-per-sec\nPeak memory: 2.719 GB\n"
-        );
-    }
-
-    #[test]
-    fn format_analysis_text_keeps_thinking_and_drops_runtime_stats() {
-        let raw = "Prompt: hidden prompt\n<think>\nQuick reasoning line.\n</think>\nGeneration: Final answer line.\n│500 tokens, 21.273 tokens-per-sec                                       │\n│Peak memory: 2.719 GB                                                   │\n╰──────────────────────────────────────────────────────────────────────────╯\n";
-        let cleaned = format_analysis_text(raw);
-        assert_eq!(
-            cleaned,
-            "<think>\nQuick reasoning line.\n</think>\nFinal answer line."
-        );
+        assert!(cleaned.contains("Prompt: hidden prompt"));
+        assert!(cleaned.contains("<think>"));
+        assert!(cleaned.contains("reasoning here"));
+        assert!(cleaned.contains("Generation: final answer"));
+        assert!(cleaned.contains("tokens-per-sec"));
     }
 }
