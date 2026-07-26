@@ -50,8 +50,6 @@ where
         (KeyCode::Enter, _) => {
             if let Some(ticker) = normalize_ticker(&app.input) {
                 app.input.clear();
-                app.alpha_scroll = 0;
-                app.ollama_scroll = 0;
                 fetch_quote(app, &ticker);
             } else {
                 app.error = Some(INVALID_TICKER_ERROR.to_string());
@@ -86,63 +84,55 @@ where
             app.set_tab_index(1);
             true
         }
-        (KeyCode::F(3), _) => {
-            app.set_tab_index(2);
+        (KeyCode::Char('['), _) if app.active_tab == AppTab::Mlx => {
+            app.prev_mlx_section();
+            true
+        }
+        (KeyCode::Char(']'), _) if app.active_tab == AppTab::Mlx => {
+            app.next_mlx_section();
+            true
+        }
+        (KeyCode::Char(c @ '1'..='6'), _) if app.active_tab == AppTab::Mlx => {
+            app.set_active_mlx_section_index((c as usize) - ('1' as usize));
             true
         }
         (KeyCode::Up, _) => {
-            match app.active_tab {
-                AppTab::AlphaVantage => {
-                    app.alpha_scroll = app.alpha_scroll.saturating_sub(1);
+            if app.active_tab == AppTab::Mlx {
+                if let Some(section) = app.active_mlx_section_mut() {
+                    section.scroll = section.scroll.saturating_sub(1);
                 }
-                AppTab::Ollama => {
-                    app.ollama_scroll = app.ollama_scroll.saturating_sub(1);
-                }
-                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::Down, _) => {
-            match app.active_tab {
-                AppTab::AlphaVantage => {
-                    app.alpha_scroll = app.alpha_scroll.saturating_add(1);
+            if app.active_tab == AppTab::Mlx {
+                if let Some(section) = app.active_mlx_section_mut() {
+                    section.scroll = section.scroll.saturating_add(1);
                 }
-                AppTab::Ollama => {
-                    app.ollama_scroll = app.ollama_scroll.saturating_add(1);
-                }
-                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::PageUp, _) => {
-            match app.active_tab {
-                AppTab::AlphaVantage => {
-                    app.alpha_scroll = app.alpha_scroll.saturating_sub(8);
+            if app.active_tab == AppTab::Mlx {
+                if let Some(section) = app.active_mlx_section_mut() {
+                    section.scroll = section.scroll.saturating_sub(8);
                 }
-                AppTab::Ollama => {
-                    app.ollama_scroll = app.ollama_scroll.saturating_sub(8);
-                }
-                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::PageDown, _) => {
-            match app.active_tab {
-                AppTab::AlphaVantage => {
-                    app.alpha_scroll = app.alpha_scroll.saturating_add(8);
+            if app.active_tab == AppTab::Mlx {
+                if let Some(section) = app.active_mlx_section_mut() {
+                    section.scroll = section.scroll.saturating_add(8);
                 }
-                AppTab::Ollama => {
-                    app.ollama_scroll = app.ollama_scroll.saturating_add(8);
-                }
-                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::Home, _) => {
-            match app.active_tab {
-                AppTab::AlphaVantage => app.alpha_scroll = 0,
-                AppTab::Ollama => app.ollama_scroll = 0,
-                AppTab::Yahoo => {}
+            if app.active_tab == AppTab::Mlx {
+                if let Some(section) = app.active_mlx_section_mut() {
+                    section.scroll = 0;
+                }
             }
             true
         }
@@ -228,18 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_scrolls_analysis_panel_with_arrow_keys() {
+    fn handle_event_scrolls_mlx_section_with_arrow_keys() {
         let mut app = App::default();
-        app.active_tab = AppTab::Ollama;
-        app.ollama_scroll = 2;
+        app.active_tab = AppTab::Mlx;
+        if let Some(section) = app.active_mlx_section_mut() {
+            section.scroll = 2;
+        }
 
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let up = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         assert!(handle_event(&mut app, down, |_app, _ticker| {}));
-        assert_eq!(app.ollama_scroll, 3);
+        assert_eq!(app.mlx_sections[0].scroll, 3);
         assert!(handle_event(&mut app, up, |_app, _ticker| {}));
-        assert_eq!(app.ollama_scroll, 2);
+        assert_eq!(app.mlx_sections[0].scroll, 2);
     }
 
     #[test]
@@ -251,10 +243,23 @@ mod tests {
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         assert!(handle_event(&mut app, right, |_app, _ticker| {}));
-        assert_eq!(app.active_tab, AppTab::AlphaVantage);
+        assert_eq!(app.active_tab, AppTab::Mlx);
         assert!(handle_event(&mut app, f2, |_app, _ticker| {}));
-        assert_eq!(app.active_tab, AppTab::AlphaVantage);
+        assert_eq!(app.active_tab, AppTab::Mlx);
         assert!(handle_event(&mut app, tab, |_app, _ticker| {}));
-        assert_eq!(app.active_tab, AppTab::Ollama);
+        assert_eq!(app.active_tab, AppTab::Yahoo);
+    }
+
+    #[test]
+    fn handle_event_switches_mlx_worker_sections() {
+        let mut app = App::default();
+        app.active_tab = AppTab::Mlx;
+        let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let jump = Event::Key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+
+        assert!(handle_event(&mut app, next, |_app, _ticker| {}));
+        assert_eq!(app.active_mlx_section_index, 1);
+        assert!(handle_event(&mut app, jump, |_app, _ticker| {}));
+        assert_eq!(app.active_mlx_section_index, 5);
     }
 }

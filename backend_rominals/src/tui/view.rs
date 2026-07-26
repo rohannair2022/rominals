@@ -6,10 +6,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 
-/// Format an Option<f64> as a price string, or "n/a" if absent.
 fn money(v: Option<f64>) -> String {
     match v {
-        Some(x) => format!("{:.2}", x),
+        Some(x) => format!("{x:.2}"),
         None => "n/a".to_string(),
     }
 }
@@ -128,17 +127,6 @@ fn panel_max_scroll(body: &str, panel_width: u16, panel_height: u16) -> u16 {
     wrapped_line_count(body, inner_width).saturating_sub(visible_lines)
 }
 
-fn alpha_tab_body(app: &App) -> String {
-    let fundamentals = app.alpha_fundamentals_snapshot.as_deref().unwrap_or(
-        "Alpha Fundamentals Snapshot\nNot loaded yet. Fetch a ticker to load Alpha Vantage fundamentals.",
-    );
-    let news = app.alpha_news_snapshot.as_deref().unwrap_or(
-        "Alpha News Snapshot\nNot loaded yet. Fetch a ticker to load Alpha Vantage news sentiment.",
-    );
-
-    format!("{fundamentals}\n\n{}\n\n{news}", "-".repeat(72))
-}
-
 fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if let Some(meta) = &app.quote {
         let quote = Table::new(
@@ -162,60 +150,70 @@ fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 }
 
-fn render_alpha_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let body = alpha_tab_body(app);
-    let max_scroll = panel_max_scroll(&body, area.width, area.height);
-    let scroll = app.alpha_scroll.min(max_scroll);
-    let title = format!("Alpha Vantage (scroll {scroll}/{max_scroll})");
+fn render_mlx_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let section_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+
+    let section_titles: Vec<String> = app
+        .mlx_sections
+        .iter()
+        .enumerate()
+        .map(|(index, section)| format!("{} {}", index + 1, section.title))
+        .collect();
+    let section_tabs = Tabs::new(section_titles)
+        .select(app.active_mlx_section_index)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("MLX Sections [ and ] / 1-6"),
+        );
+    frame.render_widget(section_tabs, section_chunks[0]);
+
+    let panel_title = match &app.comparison_ticker {
+        Some(comp) => format!("Worker Output (vs {comp})"),
+        None => "Worker Output".to_string(),
+    };
+
+    let Some(section) = app.mlx_sections.get(app.active_mlx_section_index) else {
+        let empty = Paragraph::new("No worker sections configured.")
+            .style(Style::default().fg(Color::Red))
+            .block(Block::default().borders(Borders::ALL).title(panel_title))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(empty, section_chunks[1]);
+        return;
+    };
+
+    let body = if let Some(content) = &section.content {
+        content.clone()
+    } else if let Some(error) = &app.analysis_error {
+        format!("Analysis error: {error}")
+    } else if app.analysis_loading {
+        match &app.mlx_status {
+            Some(status) => format!("Running worker: {}\n\n{status}", section.title),
+            None => format!("Running worker: {}\n\nAwaiting output...", section.title),
+        }
+    } else {
+        format!(
+            "No output yet for {}. Fetch a ticker to run worker analysis.",
+            section.title
+        )
+    };
+
+    let max_scroll = panel_max_scroll(&body, section_chunks[1].width, section_chunks[1].height);
+    let scroll = section.scroll.min(max_scroll);
+    let title = format!("{panel_title} (scroll {scroll}/{max_scroll})");
     let panel = Paragraph::new(body)
         .block(Block::default().borders(Borders::ALL).title(title))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: true });
-    frame.render_widget(panel, area);
-}
-
-fn render_ollama_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let title = match &app.comparison_ticker {
-        Some(comp) => format!("Ollama (vs {comp})"),
-        None => "Ollama".to_string(),
-    };
-
-    if app.analysis_loading {
-        let panel = Paragraph::new("Running Ollama analysis...")
-            .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(panel, area);
-        return;
-    }
-
-    if let Some(analysis) = &app.analysis {
-        let max_scroll = panel_max_scroll(analysis, area.width, area.height);
-        let scroll = app.ollama_scroll.min(max_scroll);
-        let title = format!("{title} (scroll {scroll}/{max_scroll})");
-        let panel = Paragraph::new(analysis.clone())
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(panel, area);
-        return;
-    }
-
-    if let Some(analysis_error) = &app.analysis_error {
-        let panel = Paragraph::new(format!("Analysis error: {analysis_error}"))
-            .style(Style::default().fg(Color::Red))
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(panel, area);
-        return;
-    }
-
-    let placeholder =
-        Paragraph::new("No Ollama analysis loaded yet. Fetch a ticker to generate one.")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: true });
-    frame.render_widget(placeholder, area);
+    frame.render_widget(panel, section_chunks[1]);
 }
 
 pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
@@ -237,7 +235,9 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  |  Enter fetch  Ctrl+R refresh  Tab/←/→/F1-F3 tabs  Esc quit"),
+        Span::raw(
+            "  |  Enter fetch  Ctrl+R refresh  Tab/←/→/F1-F2 tabs  [ ] or 1-6 sections  Esc quit",
+        ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
     frame.render_widget(header, outer_chunks[0]);
@@ -265,7 +265,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     .wrap(Wrap { trim: true });
     frame.render_widget(input, outer_chunks[1]);
 
-    let tabs = Tabs::new(vec!["Yahoo", "Alpha Vantage", "Ollama"])
+    let tabs = Tabs::new(vec!["Yahoo", "MLX"])
         .select(app.active_tab_index())
         .highlight_style(
             Style::default()
@@ -277,12 +277,11 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
 
     match app.active_tab {
         AppTab::Yahoo => render_yahoo_tab(frame, app, outer_chunks[3]),
-        AppTab::AlphaVantage => render_alpha_tab(frame, app, outer_chunks[3]),
-        AppTab::Ollama => render_ollama_tab(frame, app, outer_chunks[3]),
+        AppTab::Mlx => render_mlx_tab(frame, app, outer_chunks[3]),
     }
 
     let status = if app.analysis_loading {
-        Paragraph::new("Fetching quote + analysis...")
+        Paragraph::new("Fetching quote + running MLX workers...")
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL).title("Status"))
     } else {
@@ -295,9 +294,17 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 Span::raw(error),
             ]))
             .block(Block::default().borders(Borders::ALL).title("Status")),
-            None => Paragraph::new("Ready.")
-                .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL).title("Status")),
+            None => {
+                let text = app.mlx_status.as_deref().unwrap_or("Ready.");
+                let style = if app.mlx_status.is_some() {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                Paragraph::new(text)
+                    .style(style)
+                    .block(Block::default().borders(Borders::ALL).title("Status"))
+            }
         }
     };
     frame.render_widget(status, outer_chunks[4]);
