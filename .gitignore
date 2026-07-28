@@ -13,6 +13,7 @@ __pycache__/
 *.egg-info/
 .eggs/
 .venv/
+.venv-mlx/
 venv/
 env/
 .pytest_cache/
@@ -32,3 +33,4 @@ Cargo.lock
 # Environment files
 .env
 .env.*
+.venv-mlx

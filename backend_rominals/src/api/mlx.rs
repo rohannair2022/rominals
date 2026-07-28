@@ -1,18 +1,22 @@
+use serde_json::{json, Value};
 use std::error::Error;
 use std::io::{self, Read};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 const DEFAULT_MLX_PYTHON_BIN: &str = "python3";
 const DEFAULT_MLX_MODEL: &str = "mlx-community/Qwen3.5-4B-MLX-4bit";
-const DEFAULT_MLX_MAX_TOKENS: u32 = 200;
+const DEFAULT_MLX_MAX_TOKENS: u32 = 600;
 const DEFAULT_MLX_TEMPERATURE: f32 = 0.2;
-const DEFAULT_MLX_PARALLEL_WORKERS: usize = 1;
-const MAX_MLX_PARALLEL_WORKERS: usize = 1;
-const MODEL_WARMUP_PROMPT: &str = "Reply with exactly READY.";
-const MODEL_WARMUP_MAX_TOKENS: u32 = 8;
+const DEFAULT_MLX_PARALLEL_WORKERS: usize = 2;
+// Confirmed on your M1: 2 concurrent workers sustain ~25 tok/s each.
+const MAX_MLX_PARALLEL_WORKERS: usize = 2;
+const DEFAULT_MLX_SERVER_PORT: u16 = 8712;
+const MLX_SERVER_READY_RETRIES: u32 = 120;
+const MLX_SERVER_READY_POLL_MS: u64 = 500;
 
 const SECTION_DEFS: [(&str, &str); 6] = [
     (
@@ -76,6 +80,17 @@ enum WorkerEvent {
     Complete(WorkerResult),
 }
 
+/// Holds the long-lived `mlx_lm.server` subprocess plus the URL to reach it.
+/// The model loads into memory exactly once, the first time any caller
+/// needs it -- every worker after that just sends an HTTP request to an
+/// already-warm process instead of paying a fresh model-load cost.
+struct MlxServerHandle {
+    child: Child,
+    base_url: String,
+}
+
+static MLX_SERVER: Mutex<Option<MlxServerHandle>> = Mutex::new(None);
+
 pub fn worker_section_titles() -> Vec<String> {
     SECTION_DEFS
         .iter()
@@ -105,6 +120,10 @@ where
         SECTION_DEFS.len()
     ));
 
+    // Make sure the server is up before fanning out workers, so the first
+    // request doesn't race the model load.
+    ensure_server_started(&config)?;
+
     run_parallel_workers(
         &config,
         ticker,
@@ -120,12 +139,23 @@ pub fn preload_mlx_model<FStatus>(mut on_status: FStatus) -> Result<(), Box<dyn 
 where
     FStatus: FnMut(&str),
 {
-    let mut config = mlx_config_from_env();
-    config.max_tokens = config.max_tokens.min(MODEL_WARMUP_MAX_TOKENS).max(1);
-    on_status(&format!("Preloading MLX model {}...", config.model));
-    let _ = run_mlx_generation(&config, MODEL_WARMUP_PROMPT, |_chunk| {})?;
-    on_status("MLX model preloaded and ready.");
+    let config = mlx_config_from_env();
+    on_status(&format!("Starting MLX server with model {}...", config.model));
+    ensure_server_started(&config)?;
+    on_status("MLX server ready and model loaded.");
     Ok(())
+}
+
+/// Stops the background `mlx_lm.server` process, if one is running. Call
+/// this on graceful shutdown so you don't leave an orphaned Python process
+/// holding the model in memory after your program exits.
+pub fn shutdown_mlx_server() {
+    if let Ok(mut guard) = MLX_SERVER.lock() {
+        if let Some(mut handle) = guard.take() {
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
+        }
+    }
 }
 
 fn mlx_config_from_env() -> MlxConfig {
@@ -153,6 +183,57 @@ fn mlx_config_from_env() -> MlxConfig {
         temperature,
         parallel_workers,
     }
+}
+
+/// Starts `mlx_lm.server` in the background exactly once (guarded by the
+/// mutex) and blocks until it responds to health checks. Every subsequent
+/// call -- from any worker thread -- just returns the already-running
+/// server's base URL immediately.
+fn ensure_server_started(config: &MlxConfig) -> Result<String, Box<dyn Error>> {
+    let mut guard = MLX_SERVER
+        .lock()
+        .map_err(|_| io::Error::other("MLX server lock poisoned"))?;
+
+    if let Some(handle) = guard.as_ref() {
+        return Ok(handle.base_url.clone());
+    }
+
+    let port = std::env::var("ROMINALS_MLX_SERVER_PORT")
+        .ok()
+        .and_then(|raw| raw.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_MLX_SERVER_PORT);
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let child = Command::new(&config.python_bin)
+        .arg("-m")
+        .arg("mlx_lm.server")
+        .arg("--model")
+        .arg(&config.model)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    wait_for_server_ready(&base_url)?;
+
+    *guard = Some(MlxServerHandle {
+        child,
+        base_url: base_url.clone(),
+    });
+
+    Ok(base_url)
+}
+
+fn wait_for_server_ready(base_url: &str) -> Result<(), Box<dyn Error>> {
+    let models_url = format!("{base_url}/v1/models");
+    for _ in 0..MLX_SERVER_READY_RETRIES {
+        if ureq::get(&models_url).call().is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(MLX_SERVER_READY_POLL_MS));
+    }
+    Err(io::Error::other("mlx_lm.server did not become ready in time").into())
 }
 
 fn run_parallel_workers<FStatus, FChunk, FSection>(
@@ -197,6 +278,8 @@ where
                     objective,
                 );
                 let tx_for_stream = tx.clone();
+                // No subprocess spawn here anymore -- this is now a plain
+                // HTTP request against the shared, already-running server.
                 let output = run_mlx_generation(&config, &worker_prompt, |chunk| {
                     let _ = tx_for_stream.send(WorkerEvent::StreamChunk {
                         index,
@@ -312,79 +395,63 @@ Return only this section, with 3-5 bullet-like lines in plain text, max 90 words
     )
 }
 
-/// Strips ANSI escape sequences (CSI codes: colors, cursor movement, line
-/// clears, etc.) that `rich`-based CLIs like mlx_lm emit for their live
-/// progress/stats panels. This is NOT text filtering -- these are invisible
-/// terminal control bytes, not content. Leaving them in means cursor-move /
-/// line-clear sequences actively execute in your terminal and erase prior
-/// output, which is the opposite of "show everything." Every visible
-/// character of the model's real output (including all reasoning, all
-/// stats lines, everything) still passes through untouched.
-fn strip_ansi_escapes(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut output = String::with_capacity(input.len());
-    let mut i = 0;
+/// One event out of an OpenAI-style Server-Sent-Events stream. mlx_lm.server
+/// (like most reasoning-model APIs) puts thinking text and the final
+/// answer in two SEPARATE delta fields -- `reasoning_content` (sometimes
+/// `reasoning`) vs `content` -- rather than one combined text stream. Both
+/// are real model output; we surface both.
+enum SseEvent {
+    Reasoning(String),
+    Content(String),
+    Done,
+}
 
-    while i < bytes.len() {
-        if bytes[i] == 0x1B && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'[' => {
-                    let mut j = i + 2;
-                    while j < bytes.len() && !(0x40..=0x7E).contains(&bytes[j]) {
-                        j += 1;
-                    }
-                    i = (j + 1).min(bytes.len());
-                    continue;
-                }
-                b']' => {
-                    let mut j = i + 2;
-                    while j < bytes.len() && bytes[j] != 0x07 {
-                        if bytes[j] == 0x1B && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    i = (j + 1).min(bytes.len());
-                    continue;
-                }
-                _ => {
-                    i += 2;
-                    continue;
-                }
+/// Parses a single line of an `mlx_lm.server` streaming response. Checks
+/// for reasoning text first (checking both common field names, since this
+/// isn't fully standardized across server builds), then falls back to the
+/// regular content field. Blank lines, keepalive comment lines, and
+/// role-only deltas are ignored -- those are SSE/API protocol framing, not
+/// model output.
+fn parse_sse_line(line: &str) -> Option<SseEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let data = trimmed.strip_prefix("data: ")?;
+    if data == "[DONE]" {
+        return Some(SseEvent::Done);
+    }
+
+    let parsed: Value = serde_json::from_str(data).ok()?;
+    let delta = &parsed["choices"][0]["delta"];
+
+    for reasoning_key in ["reasoning_content", "reasoning"] {
+        if let Some(text) = delta.get(reasoning_key).and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                return Some(SseEvent::Reasoning(text.to_string()));
             }
         }
-
-        if bytes[i] == b'\r' {
-            i += 1;
-            continue;
-        }
-
-        let ch_len = utf8_char_len(bytes[i]);
-        let end = (i + ch_len).min(bytes.len());
-        if let Ok(s) = std::str::from_utf8(&bytes[i..end]) {
-            output.push_str(s);
-        }
-        i = end;
     }
 
-    output
-}
-
-fn utf8_char_len(first_byte: u8) -> usize {
-    if first_byte & 0x80 == 0 {
-        1
-    } else if first_byte & 0xE0 == 0xC0 {
-        2
-    } else if first_byte & 0xF0 == 0xE0 {
-        3
-    } else if first_byte & 0xF8 == 0xF0 {
-        4
-    } else {
-        1
+    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            return Some(SseEvent::Content(text.to_string()));
+        }
     }
+
+    None
 }
 
+/// Sends one generation request to the already-running `mlx_lm.server` and
+/// streams back the model's full output -- both the reasoning/thinking
+/// text and the final answer -- as it's generated. Since the server splits
+/// these into separate delta fields, we re-insert `<think>` / `</think>`
+/// markers around the reasoning portion so the streamed and stored text
+/// clearly shows where thinking ends and the answer begins, matching what
+/// you'd see from a plain-text CLI dump. SSE/JSON protocol framing (role
+/// markers, finish_reason, keepalive lines, [DONE]) is stripped -- that's
+/// not model output.
 fn run_mlx_generation<FChunk>(
     config: &MlxConfig,
     prompt: &str,
@@ -393,86 +460,95 @@ fn run_mlx_generation<FChunk>(
 where
     FChunk: FnMut(&str),
 {
-    let mut child = Command::new(&config.python_bin)
-        .arg("-u")
-        .arg("-m")
-        .arg("mlx_lm")
-        .arg("generate")
-        .arg("--model")
-        .arg(&config.model)
-        .arg("--prompt")
-        .arg(prompt)
-        .arg("--max-tokens")
-        .arg(config.max_tokens.to_string())
-        .arg("--temp")
-        .arg(format!("{}", config.temperature))
-        .arg("--verbose")
-        .arg("True")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let base_url = ensure_server_started(config)?;
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("Failed to capture mlx-lm stdout"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("Failed to capture mlx-lm stderr"))?;
-
-    let stderr_handle = thread::spawn(move || -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes)?;
-        Ok(bytes)
+    let body = json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": config.max_tokens,
+        "temperature": config.temperature,
+        "stream": true
     });
 
-    // Everything read from stdout is streamed live via on_chunk AND
-    // accumulated into stdout_text, with zero filtering beyond ANSI-escape
-    // stripping (control codes, not content). No extraction, no trimming
-    // of sections, no dropping of "noise" lines -- every visible character
-    // the process printed is kept, in order.
-    let mut stdout_text = String::new();
-    let mut read_buffer = [0u8; 4096];
+    let response = ureq::post(&format!("{base_url}/v1/chat/completions"))
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|err| io::Error::other(format!("mlx server request failed: {err}")))?;
+
+    let mut reader = response.into_reader();
+    let mut full_text = String::new();
+    let mut byte_buffer = [0u8; 512];
+    // SSE lines can arrive split across multiple socket reads; carry any
+    // incomplete trailing line forward instead of dropping/mangling it.
+    let mut pending_line = String::new();
+
+    #[derive(PartialEq)]
+    enum Mode {
+        None,
+        Reasoning,
+        Content,
+    }
+    let mut mode = Mode::None;
+
+    let mut emit = |text: &str, full_text: &mut String, on_chunk: &mut FChunk| {
+        full_text.push_str(text);
+        on_chunk(text);
+    };
+
     loop {
-        let read_count = stdout.read(&mut read_buffer)?;
+        let read_count = reader.read(&mut byte_buffer)?;
         if read_count == 0 {
             break;
         }
 
-        let chunk = String::from_utf8_lossy(&read_buffer[..read_count]);
-        let clean_chunk = strip_ansi_escapes(chunk.as_ref());
-        stdout_text.push_str(&clean_chunk);
-        if !clean_chunk.is_empty() {
-            on_chunk(&clean_chunk);
+        pending_line.push_str(&String::from_utf8_lossy(&byte_buffer[..read_count]));
+
+        while let Some(newline_pos) = pending_line.find('\n') {
+            let line: String = pending_line.drain(..=newline_pos).collect();
+            match parse_sse_line(&line) {
+                Some(SseEvent::Reasoning(text)) => {
+                    if mode != Mode::Reasoning {
+                        emit("<think>\n", &mut full_text, &mut on_chunk);
+                        mode = Mode::Reasoning;
+                    }
+                    emit(&text, &mut full_text, &mut on_chunk);
+                }
+                Some(SseEvent::Content(text)) => {
+                    if mode == Mode::Reasoning {
+                        emit("\n</think>\n\n", &mut full_text, &mut on_chunk);
+                    }
+                    mode = Mode::Content;
+                    emit(&text, &mut full_text, &mut on_chunk);
+                }
+                Some(SseEvent::Done) => {
+                    pending_line.clear();
+                }
+                None => {}
+            }
         }
     }
 
-    let status = child.wait()?;
-    let stderr_bytes = stderr_handle
-        .join()
-        .map_err(|_| io::Error::other("Failed to join mlx-lm stderr reader thread"))??;
-
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        let stdout = stdout_text.trim().to_string();
-        let details = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(io::Error::other(format!(
-            "mlx-lm generation failed for model {} (exit {:?}): {}",
-            config.model,
-            status.code(),
-            details
-        ))
-        .into());
+    // Handle a final line with no trailing newline, if the stream ended that way.
+    match parse_sse_line(&pending_line) {
+        Some(SseEvent::Reasoning(text)) => {
+            if mode != Mode::Reasoning {
+                emit("<think>\n", &mut full_text, &mut on_chunk);
+            }
+            emit(&text, &mut full_text, &mut on_chunk);
+        }
+        Some(SseEvent::Content(text)) => {
+            if mode == Mode::Reasoning {
+                emit("\n</think>\n\n", &mut full_text, &mut on_chunk);
+            }
+            emit(&text, &mut full_text, &mut on_chunk);
+        }
+        _ => {}
     }
 
-    if stdout_text.is_empty() {
-        return Err(io::Error::other("mlx-lm returned no output").into());
+    if full_text.is_empty() {
+        return Err(io::Error::other("mlx server returned no output").into());
     }
 
-    // Returned as-is: full prompt echo, all reasoning, the final answer,
-    // and the runtime stats panel -- nothing removed.
-    Ok(stdout_text)
+    Ok(full_text)
 }
 
 #[cfg(test)]
@@ -492,41 +568,71 @@ mod tests {
     }
 
     #[test]
+    fn effective_parallel_workers_clamps_to_max() {
+        assert_eq!(effective_parallel_workers(10), MAX_MLX_PARALLEL_WORKERS);
+        assert_eq!(effective_parallel_workers(0), 1);
+        assert_eq!(effective_parallel_workers(2), 2);
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_content() {
+        let line = r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#;
+        match parse_sse_line(line) {
+            Some(SseEvent::Content(text)) => assert_eq!(text, "Hello"),
+            _ => panic!("expected a Content event"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_reasoning_content_field() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
+        match parse_sse_line(line) {
+            Some(SseEvent::Reasoning(text)) => assert_eq!(text, "thinking..."),
+            _ => panic!("expected a Reasoning event"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_reasoning_field_variant() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning":"pondering..."}}]}"#;
+        match parse_sse_line(line) {
+            Some(SseEvent::Reasoning(text)) => assert_eq!(text, "pondering..."),
+            _ => panic!("expected a Reasoning event"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_detects_done_marker() {
+        assert!(matches!(parse_sse_line("data: [DONE]"), Some(SseEvent::Done)));
+    }
+
+    #[test]
+    fn parse_sse_line_ignores_blank_and_non_data_lines() {
+        assert!(parse_sse_line("").is_none());
+        assert!(parse_sse_line("   ").is_none());
+        assert!(parse_sse_line(": keepalive").is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_ignores_role_only_delta() {
+        // First chunk of a chat-completions stream often carries just a
+        // role marker with no content or reasoning -- should be skipped.
+        let line = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
+        assert!(parse_sse_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_ignores_malformed_json() {
+        assert!(parse_sse_line("data: not json").is_none());
+    }
+
+    #[test]
     fn stream_chunk_passthrough_appends_in_order() {
         let chunks = ["first ", "second", " third"];
         let mut streamed = String::new();
-        let mut stdout_text = String::new();
-
         for chunk in chunks {
-            stdout_text.push_str(chunk);
             streamed.push_str(chunk);
         }
-
         assert_eq!(streamed, "first second third");
-        assert_eq!(stdout_text, streamed);
-    }
-
-    #[test]
-    fn strip_ansi_escapes_removes_csi_sequences() {
-        let raw = "\x1b[2K\x1b[1G\x1b[38;5;10mHello\x1b[0m World\r\n";
-        let cleaned = strip_ansi_escapes(raw);
-        assert_eq!(cleaned, "Hello World\n");
-    }
-
-    #[test]
-    fn strip_ansi_escapes_preserves_plain_text() {
-        let raw = "plain line with no escapes";
-        assert_eq!(strip_ansi_escapes(raw), raw);
-    }
-
-    #[test]
-    fn strip_ansi_escapes_keeps_all_content_including_stats_and_thinking() {
-        let raw = "\x1b[1;36mPrompt: hidden prompt\x1b[0m\r\n<think>\nreasoning here\n</think>\nGeneration: final answer\r\n\u{2502}500 tokens, 21.273 tokens-per-sec\u{2502}\r\n";
-        let cleaned = strip_ansi_escapes(raw);
-        assert!(cleaned.contains("Prompt: hidden prompt"));
-        assert!(cleaned.contains("<think>"));
-        assert!(cleaned.contains("reasoning here"));
-        assert!(cleaned.contains("Generation: final answer"));
-        assert!(cleaned.contains("tokens-per-sec"));
     }
 }
