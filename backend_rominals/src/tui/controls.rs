@@ -84,55 +84,120 @@ where
             app.set_tab_index(1);
             true
         }
-        (KeyCode::Char('['), _) if app.active_tab == AppTab::Mlx => {
-            app.prev_mlx_section();
+        (KeyCode::F(3), _) => {
+            app.set_tab_index(2);
             true
         }
-        (KeyCode::Char(']'), _) if app.active_tab == AppTab::Mlx => {
-            app.next_mlx_section();
+        (KeyCode::Char('['), _) => {
+            match app.active_tab {
+                AppTab::Mlx => app.prev_mlx_section(),
+                AppTab::Finnhub => app.prev_finnhub_dataset(),
+                AppTab::Yahoo => {}
+            }
             true
         }
-        (KeyCode::Char(c @ '1'..='6'), _) if app.active_tab == AppTab::Mlx => {
-            app.set_active_mlx_section_index((c as usize) - ('1' as usize));
+        (KeyCode::Char(']'), _) => {
+            match app.active_tab {
+                AppTab::Mlx => app.next_mlx_section(),
+                AppTab::Finnhub => app.next_finnhub_dataset(),
+                AppTab::Yahoo => {}
+            }
+            true
+        }
+        (KeyCode::Char(c @ '1'..='9'), _) => {
+            let index = (c as usize) - ('1' as usize);
+            match app.active_tab {
+                AppTab::Mlx => {
+                    if index < app.mlx_sections.len() {
+                        app.set_active_mlx_section_index(index);
+                    }
+                }
+                AppTab::Finnhub => {
+                    if index < app.finnhub_datasets.len() {
+                        app.set_active_finnhub_dataset_index(index);
+                    }
+                }
+                AppTab::Yahoo => {}
+            }
             true
         }
         (KeyCode::Up, _) => {
-            if app.active_tab == AppTab::Mlx {
-                if let Some(section) = app.active_mlx_section_mut() {
-                    section.scroll = section.scroll.saturating_sub(1);
+            match app.active_tab {
+                AppTab::Mlx => {
+                    if let Some(section) = app.active_mlx_section_mut() {
+                        section.scroll = section.scroll.saturating_sub(1);
+                    }
                 }
+                AppTab::Finnhub => {
+                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                        dataset.scroll = dataset.scroll.saturating_sub(1);
+                    }
+                }
+                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::Down, _) => {
-            if app.active_tab == AppTab::Mlx {
-                if let Some(section) = app.active_mlx_section_mut() {
-                    section.scroll = section.scroll.saturating_add(1);
+            match app.active_tab {
+                AppTab::Mlx => {
+                    if let Some(section) = app.active_mlx_section_mut() {
+                        section.scroll = section.scroll.saturating_add(1);
+                    }
                 }
+                AppTab::Finnhub => {
+                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                        dataset.scroll = dataset.scroll.saturating_add(1);
+                    }
+                }
+                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::PageUp, _) => {
-            if app.active_tab == AppTab::Mlx {
-                if let Some(section) = app.active_mlx_section_mut() {
-                    section.scroll = section.scroll.saturating_sub(8);
+            match app.active_tab {
+                AppTab::Mlx => {
+                    if let Some(section) = app.active_mlx_section_mut() {
+                        section.scroll = section.scroll.saturating_sub(8);
+                    }
                 }
+                AppTab::Finnhub => {
+                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                        dataset.scroll = dataset.scroll.saturating_sub(8);
+                    }
+                }
+                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::PageDown, _) => {
-            if app.active_tab == AppTab::Mlx {
-                if let Some(section) = app.active_mlx_section_mut() {
-                    section.scroll = section.scroll.saturating_add(8);
+            match app.active_tab {
+                AppTab::Mlx => {
+                    if let Some(section) = app.active_mlx_section_mut() {
+                        section.scroll = section.scroll.saturating_add(8);
+                    }
                 }
+                AppTab::Finnhub => {
+                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                        dataset.scroll = dataset.scroll.saturating_add(8);
+                    }
+                }
+                AppTab::Yahoo => {}
             }
             true
         }
         (KeyCode::Home, _) => {
-            if app.active_tab == AppTab::Mlx {
-                if let Some(section) = app.active_mlx_section_mut() {
-                    section.scroll = 0;
+            match app.active_tab {
+                AppTab::Mlx => {
+                    if let Some(section) = app.active_mlx_section_mut() {
+                        section.scroll = 0;
+                    }
                 }
+                AppTab::Finnhub => {
+                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                        dataset.scroll = 0;
+                    }
+                }
+                AppTab::Yahoo => {}
             }
             true
         }
@@ -240,12 +305,15 @@ mod tests {
 
         let right = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let f2 = Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let f3 = Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         assert!(handle_event(&mut app, right, |_app, _ticker| {}));
         assert_eq!(app.active_tab, AppTab::Mlx);
         assert!(handle_event(&mut app, f2, |_app, _ticker| {}));
         assert_eq!(app.active_tab, AppTab::Mlx);
+        assert!(handle_event(&mut app, f3, |_app, _ticker| {}));
+        assert_eq!(app.active_tab, AppTab::Finnhub);
         assert!(handle_event(&mut app, tab, |_app, _ticker| {}));
         assert_eq!(app.active_tab, AppTab::Yahoo);
     }
@@ -255,11 +323,24 @@ mod tests {
         let mut app = App::default();
         app.active_tab = AppTab::Mlx;
         let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        let jump = Event::Key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE));
+        let jump = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
 
         assert!(handle_event(&mut app, next, |_app, _ticker| {}));
         assert_eq!(app.active_mlx_section_index, 1);
         assert!(handle_event(&mut app, jump, |_app, _ticker| {}));
-        assert_eq!(app.active_mlx_section_index, 5);
+        assert_eq!(app.active_mlx_section_index, 1);
+    }
+
+    #[test]
+    fn handle_event_switches_finnhub_datasets() {
+        let mut app = App::default();
+        app.active_tab = AppTab::Finnhub;
+        let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let jump = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert!(handle_event(&mut app, next, |_app, _ticker| {}));
+        assert_eq!(app.active_finnhub_dataset_index, 1);
+        assert!(handle_event(&mut app, jump, |_app, _ticker| {}));
+        assert_eq!(app.active_finnhub_dataset_index, 1);
     }
 }

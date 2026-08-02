@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use serde_json::Value;
 
 fn money(v: Option<f64>) -> String {
     match v {
@@ -127,6 +128,211 @@ fn panel_max_scroll(body: &str, panel_width: u16, panel_height: u16) -> u16 {
     wrapped_line_count(body, inner_width).saturating_sub(visible_lines)
 }
 
+fn format_float(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.precision$}"),
+        None => "n/a".to_string(),
+    }
+}
+
+fn ascii_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate().take(widths.len()) {
+            widths[index] = widths[index].max(cell.len());
+        }
+    }
+
+    let border = format!(
+        "+{}+",
+        widths
+            .iter()
+            .map(|width| "-".repeat(width + 2))
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    let header_row = format!(
+        "| {} |",
+        headers
+            .iter()
+            .enumerate()
+            .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+
+    let mut lines = Vec::with_capacity(rows.len() + 4);
+    lines.push(border.clone());
+    lines.push(header_row);
+    lines.push(border.clone());
+
+    for row in rows {
+        let row_text = format!(
+            "| {} |",
+            widths
+                .iter()
+                .enumerate()
+                .map(|(index, width)| {
+                    let value = row.get(index).map(String::as_str).unwrap_or("");
+                    format!("{value:<width$}", width = *width)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        lines.push(row_text);
+    }
+
+    lines.push(border);
+    lines.join("\n")
+}
+
+fn format_market_sentiment_table(content: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(content).ok()?;
+    let symbol = payload
+        .get("symbol")
+        .and_then(Value::as_str)
+        .unwrap_or("n/a")
+        .to_string();
+    let sentiment = payload.get("sentiment");
+    let buzz = payload.get("buzz");
+
+    let rows = vec![
+        vec![
+            "Company News Score".to_string(),
+            format_float(payload.get("companyNewsScore").and_then(Value::as_f64), 3),
+        ],
+        vec![
+            "Sector Avg News Score".to_string(),
+            format_float(
+                payload
+                    .get("sectorAverageNewsScore")
+                    .and_then(Value::as_f64),
+                3,
+            ),
+        ],
+        vec![
+            "Bullish Percent".to_string(),
+            format!(
+                "{}%",
+                format_float(
+                    sentiment
+                        .and_then(|value| value.get("bullishPercent"))
+                        .and_then(Value::as_f64),
+                    1
+                )
+            ),
+        ],
+        vec![
+            "Bearish Percent".to_string(),
+            format!(
+                "{}%",
+                format_float(
+                    sentiment
+                        .and_then(|value| value.get("bearishPercent"))
+                        .and_then(Value::as_f64),
+                    1
+                )
+            ),
+        ],
+        vec![
+            "Sector Avg Bullish".to_string(),
+            format!(
+                "{}%",
+                format_float(
+                    payload
+                        .get("sectorAverageBullishPercent")
+                        .and_then(Value::as_f64),
+                    1
+                )
+            ),
+        ],
+        vec![
+            "Articles Last Week".to_string(),
+            buzz.and_then(|value| value.get("articlesInLastWeek"))
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+        ],
+        vec![
+            "Buzz This Week".to_string(),
+            format_float(
+                buzz.and_then(|value| value.get("buzz"))
+                    .and_then(Value::as_f64),
+                3,
+            ),
+        ],
+        vec![
+            "Weekly Avg Buzz".to_string(),
+            format_float(
+                buzz.and_then(|value| value.get("weeklyAverage"))
+                    .and_then(Value::as_f64),
+                3,
+            ),
+        ],
+    ];
+
+    let table = ascii_table(&["Metric", "Value"], &rows);
+    Some(format!("Market Sentiment ({symbol})\n{table}"))
+}
+
+fn format_insider_sentiment_table(content: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(content).ok()?;
+    let symbol = payload
+        .get("symbol")
+        .and_then(Value::as_str)
+        .unwrap_or("n/a")
+        .to_string();
+    let data = payload.get("data")?.as_array()?;
+
+    let mut entries: Vec<(i64, i64, Option<f64>, Option<f64>)> = data
+        .iter()
+        .map(|row| {
+            (
+                row.get("year").and_then(Value::as_i64).unwrap_or(0),
+                row.get("month").and_then(Value::as_i64).unwrap_or(0),
+                row.get("mspr").and_then(Value::as_f64),
+                row.get("change").and_then(Value::as_f64),
+            )
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return Some(format!(
+            "Insider Sentiment ({symbol})\nNo records returned."
+        ));
+    }
+
+    entries.sort_by(|left, right| (right.0, right.1).cmp(&(left.0, left.1)));
+    let max_rows = 24;
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .take(max_rows)
+        .map(|(year, month, mspr, change)| {
+            vec![
+                year.to_string(),
+                format!("{month:02}"),
+                format_float(*mspr, 3),
+                format_float(*change, 3),
+            ]
+        })
+        .collect();
+    let table = ascii_table(&["Year", "Month", "MSPR", "Change"], &rows);
+
+    Some(format!(
+        "Insider Sentiment ({symbol})\n{table}\nShowing {} of {} records",
+        rows.len(),
+        entries.len()
+    ))
+}
+
+fn format_finnhub_dataset_body(title: &str, content: &str) -> Option<String> {
+    match title {
+        "Market Sentiment" => format_market_sentiment_table(content),
+        "Insider Sentiment" => format_insider_sentiment_table(content),
+        _ => None,
+    }
+}
+
 fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if let Some(meta) = &app.quote {
         let quote = Table::new(
@@ -162,6 +368,11 @@ fn render_mlx_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .enumerate()
         .map(|(index, section)| format!("{} {}", index + 1, section.title))
         .collect();
+    let section_hotkey_hint = if app.mlx_sections.is_empty() {
+        "1-0".to_string()
+    } else {
+        format!("1-{}", app.mlx_sections.len().min(9))
+    };
     let section_tabs = Tabs::new(section_titles)
         .select(app.active_mlx_section_index)
         .highlight_style(
@@ -172,7 +383,7 @@ fn render_mlx_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("MLX Sections [ and ] / 1-6"),
+                .title(format!("MLX Sections [ and ] / {section_hotkey_hint}")),
         );
     frame.render_widget(section_tabs, section_chunks[0]);
 
@@ -216,6 +427,78 @@ fn render_mlx_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(panel, section_chunks[1]);
 }
 
+fn render_finnhub_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let dataset_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+
+    let dataset_titles: Vec<String> = app
+        .finnhub_datasets
+        .iter()
+        .enumerate()
+        .map(|(index, dataset)| format!("{} {}", index + 1, dataset.title))
+        .collect();
+    let dataset_hotkey_hint = if app.finnhub_datasets.is_empty() {
+        "1-0".to_string()
+    } else {
+        format!("1-{}", app.finnhub_datasets.len().min(9))
+    };
+    let dataset_tabs = Tabs::new(dataset_titles)
+        .select(app.active_finnhub_dataset_index)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Finnhub Datasets [ and ] / {dataset_hotkey_hint}")),
+        );
+    frame.render_widget(dataset_tabs, dataset_chunks[0]);
+
+    let Some(dataset) = app.finnhub_datasets.get(app.active_finnhub_dataset_index) else {
+        let empty = Paragraph::new("No Finnhub datasets configured.")
+            .style(Style::default().fg(Color::Red))
+            .block(Block::default().borders(Borders::ALL).title("Finnhub"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(empty, dataset_chunks[1]);
+        return;
+    };
+
+    let raw_body = if let Some(content) = &dataset.content {
+        content.clone()
+    } else {
+        app.finnhub_status.clone().unwrap_or_else(|| {
+            "No Finnhub data loaded yet. Set ROMINALS_FINNHUB_API_KEY and fetch a ticker."
+                .to_string()
+        })
+    };
+    let body = if dataset.is_error {
+        raw_body
+    } else if let Some(formatted) = format_finnhub_dataset_body(&dataset.title, &raw_body) {
+        formatted
+    } else {
+        raw_body
+    };
+
+    let max_scroll = panel_max_scroll(&body, dataset_chunks[1].width, dataset_chunks[1].height);
+    let scroll = dataset.scroll.min(max_scroll);
+    let title = format!("{} (scroll {scroll}/{max_scroll})", dataset.title);
+    let panel_style = if dataset.is_error {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    };
+    let panel = Paragraph::new(body)
+        .style(panel_style)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, dataset_chunks[1]);
+}
+
 pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     let outer_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -236,7 +519,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Enter fetch  Ctrl+R refresh  Tab/←/→/F1-F2 tabs  [ ] or 1-6 sections  Esc quit",
+            "  |  Enter fetch  Ctrl+R refresh  Tab/←/→/F1-F3 tabs  [ ] or 1-9 sections  Esc quit",
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
@@ -265,7 +548,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     .wrap(Wrap { trim: true });
     frame.render_widget(input, outer_chunks[1]);
 
-    let tabs = Tabs::new(vec!["Yahoo", "MLX"])
+    let tabs = Tabs::new(vec!["Yahoo", "MLX", "Finnhub"])
         .select(app.active_tab_index())
         .highlight_style(
             Style::default()
@@ -278,10 +561,11 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     match app.active_tab {
         AppTab::Yahoo => render_yahoo_tab(frame, app, outer_chunks[3]),
         AppTab::Mlx => render_mlx_tab(frame, app, outer_chunks[3]),
+        AppTab::Finnhub => render_finnhub_tab(frame, app, outer_chunks[3]),
     }
 
     let status = if app.analysis_loading {
-        Paragraph::new("Fetching quote + running MLX workers...")
+        Paragraph::new("Fetching quote + Finnhub datasets + running MLX workers...")
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL).title("Status"))
     } else {
@@ -295,8 +579,12 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
             ]))
             .block(Block::default().borders(Borders::ALL).title("Status")),
             None => {
-                let text = app.mlx_status.as_deref().unwrap_or("Ready.");
-                let style = if app.mlx_status.is_some() {
+                let active_status = match app.active_tab {
+                    AppTab::Finnhub => app.finnhub_status.as_deref(),
+                    AppTab::Yahoo | AppTab::Mlx => app.mlx_status.as_deref(),
+                };
+                let text = active_status.unwrap_or("Ready.");
+                let style = if active_status.is_some() {
                     Style::default().fg(Color::Cyan)
                 } else {
                     Style::default().fg(Color::Green)
@@ -356,5 +644,45 @@ mod tests {
         symbol_only.long_name = None;
         symbol_only.short_name = None;
         assert_eq!(display_name(&symbol_only), "AAPL");
+    }
+
+    #[test]
+    fn market_sentiment_renders_table() {
+        let json = r#"{
+            "symbol": "AAPL",
+            "companyNewsScore": 0.42,
+            "sectorAverageNewsScore": 0.38,
+            "sectorAverageBullishPercent": 61.5,
+            "sentiment": {
+                "bullishPercent": 66.2,
+                "bearishPercent": 33.8
+            },
+            "buzz": {
+                "articlesInLastWeek": 123,
+                "buzz": 1.4,
+                "weeklyAverage": 1.1
+            }
+        }"#;
+
+        let table = format_market_sentiment_table(json).unwrap();
+        assert!(table.contains("Market Sentiment (AAPL)"));
+        assert!(table.contains("Company News Score"));
+        assert!(table.contains("Bullish Percent"));
+    }
+
+    #[test]
+    fn insider_sentiment_renders_latest_first() {
+        let json = r#"{
+            "symbol": "AAPL",
+            "data": [
+                {"year": 2024, "month": 2, "mspr": 1.2, "change": 0.1},
+                {"year": 2024, "month": 3, "mspr": 1.1, "change": -0.2}
+            ]
+        }"#;
+
+        let table = format_insider_sentiment_table(json).unwrap();
+        let march_index = table.find("2024 | 03").unwrap();
+        let feb_index = table.find("2024 | 02").unwrap();
+        assert!(march_index < feb_index);
     }
 }

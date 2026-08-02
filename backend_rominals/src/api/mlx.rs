@@ -1,47 +1,32 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error;
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_MLX_PYTHON_BIN: &str = "python3";
 const DEFAULT_MLX_MODEL: &str = "mlx-community/Qwen3.5-4B-MLX-4bit";
 const DEFAULT_MLX_MAX_TOKENS: u32 = 600;
 const DEFAULT_MLX_TEMPERATURE: f32 = 0.2;
 const DEFAULT_MLX_PARALLEL_WORKERS: usize = 2;
+const DEFAULT_MLX_ENABLE_THINKING: bool = false;
 // Confirmed on your M1: 2 concurrent workers sustain ~25 tok/s each.
 const MAX_MLX_PARALLEL_WORKERS: usize = 2;
 const DEFAULT_MLX_SERVER_PORT: u16 = 8712;
 const MLX_SERVER_READY_RETRIES: u32 = 120;
 const MLX_SERVER_READY_POLL_MS: u64 = 500;
 
-const SECTION_DEFS: [(&str, &str); 6] = [
+const SECTION_DEFS: [(&str, &str); 2] = [
     (
-        "TAM / Market",
-        "Target market, growth rate, and share-taker vs tide-rider framing.",
+        "Macro Outlook",
+        "Industry-standard top-down regime analysis: growth/inflation/rates/liquidity backdrop, policy + geopolitical transmission channels, and base/bull/bear path for the next 3-6 months.",
     ),
     (
-        "Relative Valuation",
-        "P/S, P/E or EV/EBITDA, PEG, and direct comp comparison with valuation rationale.",
-    ),
-    (
-        "Fundamentals",
-        "Revenue/margin trajectory, FCF, SBC dilution pressure, and balance-sheet quality.",
-    ),
-    (
-        "Catalysts + Macro",
-        "Near-term catalysts plus macro/geopolitical factors that specifically impact this name.",
-    ),
-    (
-        "Risks + Competitors",
-        "Concentrated downside risks, market share map, and moat durability check.",
-    ),
-    (
-        "Technicals + Entry",
-        "Trend vs key moving averages, relative strength framing, and preferred entry discipline.",
+        "Micro Outlook",
+        "Industry-standard bottom-up equity analysis: business quality, margins/FCF durability, valuation vs peers (P/S, EV, EV/EBITDA where available), catalysts, and downside risks.",
     ),
 ];
 
@@ -52,6 +37,7 @@ struct MlxConfig {
     max_tokens: u32,
     temperature: f32,
     parallel_workers: usize,
+    enable_thinking: bool,
 }
 
 #[derive(Debug)]
@@ -114,10 +100,11 @@ where
     let config = mlx_config_from_env();
     let parallel_workers = effective_parallel_workers(config.parallel_workers);
     on_status(&format!(
-        "Running MLX workers with model {} (parallel: {}, sections: {})...\n",
+        "Running MLX workers with model {} (parallel: {}, sections: {}, thinking: {})...\n",
         config.model,
         parallel_workers,
-        SECTION_DEFS.len()
+        SECTION_DEFS.len(),
+        if config.enable_thinking { "on" } else { "off" }
     ));
 
     // Make sure the server is up before fanning out workers, so the first
@@ -140,7 +127,10 @@ where
     FStatus: FnMut(&str),
 {
     let config = mlx_config_from_env();
-    on_status(&format!("Starting MLX server with model {}...", config.model));
+    on_status(&format!(
+        "Starting MLX server with model {}...",
+        config.model
+    ));
     ensure_server_started(&config)?;
     on_status("MLX server ready and model loaded.");
     Ok(())
@@ -159,9 +149,10 @@ pub fn shutdown_mlx_server() {
 }
 
 fn mlx_config_from_env() -> MlxConfig {
-    let python_bin =
-        std::env::var("ROMINALS_MLX_PYTHON_BIN").unwrap_or_else(|_| DEFAULT_MLX_PYTHON_BIN.to_string());
-    let model = std::env::var("ROMINALS_MLX_MODEL").unwrap_or_else(|_| DEFAULT_MLX_MODEL.to_string());
+    let python_bin = std::env::var("ROMINALS_MLX_PYTHON_BIN")
+        .unwrap_or_else(|_| DEFAULT_MLX_PYTHON_BIN.to_string());
+    let model =
+        std::env::var("ROMINALS_MLX_MODEL").unwrap_or_else(|_| DEFAULT_MLX_MODEL.to_string());
     let max_tokens = std::env::var("ROMINALS_MLX_MAX_TOKENS")
         .ok()
         .and_then(|raw| raw.parse::<u32>().ok())
@@ -175,6 +166,11 @@ fn mlx_config_from_env() -> MlxConfig {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MLX_PARALLEL_WORKERS);
+    let enable_thinking = std::env::var("ROMINALS_MLX_ENABLE_THINKING")
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+        .unwrap_or(DEFAULT_MLX_ENABLE_THINKING);
 
     MlxConfig {
         python_bin,
@@ -182,6 +178,16 @@ fn mlx_config_from_env() -> MlxConfig {
         max_tokens,
         temperature,
         parallel_workers,
+        enable_thinking,
+    }
+}
+
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -344,7 +350,8 @@ where
 }
 
 fn effective_parallel_workers(requested_workers: usize) -> usize {
-    requested_workers.clamp(1, MAX_MLX_PARALLEL_WORKERS)
+    let max_allowed = MAX_MLX_PARALLEL_WORKERS.min(SECTION_DEFS.len().max(1));
+    requested_workers.clamp(1, max_allowed)
 }
 
 fn format_worker_status(
@@ -374,7 +381,11 @@ fn build_section_prompt(
     objective: &str,
 ) -> String {
     let comparison_text = comparison_ticker
-        .map(|comp| format!("Compare against {comp} where relevant."))
+        .map(|comp| {
+            format!(
+                "Comparison anchor: {comp}. Compare relative strength and valuation where possible."
+            )
+        })
         .unwrap_or_default();
     let data_context = snapshot_context.unwrap_or(
         "Structured fundamentals snapshot unavailable for this run. Use available context and avoid fabricating metrics.",
@@ -382,16 +393,28 @@ fn build_section_prompt(
 
     format!(
         "You are one worker in a parallel investment research pipeline.\n\
-Ticker: {ticker}\n\
+Target ticker: {ticker}\n\
 {comparison_text}\n\
 Worker scope: {section_title}\n\
 Objective: {objective}\n\
-Rules: keep the response short and concise, data-dense, plain text only, no markdown, no filler.\n\
+Execution rules:\n\
+- Start from the provided Yahoo context first; do not restate it verbatim.\n\
+- Apply institutional top-down/bottom-up thinking based on the worker scope.\n\
+- Translate the context into implications, tradeoffs, and risk-adjusted conclusions.\n\
+- If a metric is missing (for example P/S, EV, EV/EBITDA), explicitly mark it as unknown.\n\
+- Use concise plain text only, no markdown, no filler.\n\
+\n\
+Heuristic playbook (soft assumptions, apply only if supporting data exists):\n\
+- Low P/S + high EV or high EV/EBITDA can mean the equity looks optically cheap while enterprise burden/risk remains high; treat as mixed until margin/FCF quality confirms.\n\
+- Price near 52-week highs with positive day momentum often implies trend strength but higher pullback risk.\n\
+- Price near 52-week lows with weak momentum can be either value entry or structural deterioration; require a catalyst check.\n\
+- Large move on high volume implies stronger conviction than the same move on light volume.\n\
+\n\
 Use the context below first and clearly mark uncertainty instead of inventing data.\n\
 \n\
 Context:\n{data_context}\n\
 \n\
-Return only this section, with 3-5 bullet-like lines in plain text, max 90 words total."
+Return only this section, with 5-7 bullet-like lines in plain text, max 170 words total."
     )
 }
 
@@ -403,6 +426,12 @@ Return only this section, with 3-5 bullet-like lines in plain text, max 90 words
 enum SseEvent {
     Reasoning(String),
     Content(String),
+    /// Token-count summary the server sends (when asked via
+    /// stream_options.include_usage) -- usually in a final chunk with an
+    /// empty choices array, right before [DONE].
+    Usage {
+        completion_tokens: u64,
+    },
     Done,
 }
 
@@ -424,6 +453,15 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     }
 
     let parsed: Value = serde_json::from_str(data).ok()?;
+
+    if let Some(completion_tokens) = parsed
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(|value| value.as_u64())
+    {
+        return Some(SseEvent::Usage { completion_tokens });
+    }
+
     let delta = &parsed["choices"][0]["delta"];
 
     for reasoning_key in ["reasoning_content", "reasoning"] {
@@ -444,14 +482,12 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
 }
 
 /// Sends one generation request to the already-running `mlx_lm.server` and
-/// streams back the model's full output -- both the reasoning/thinking
-/// text and the final answer -- as it's generated. Since the server splits
-/// these into separate delta fields, we re-insert `<think>` / `</think>`
-/// markers around the reasoning portion so the streamed and stored text
-/// clearly shows where thinking ends and the answer begins, matching what
-/// you'd see from a plain-text CLI dump. SSE/JSON protocol framing (role
-/// markers, finish_reason, keepalive lines, [DONE]) is stripped -- that's
-/// not model output.
+/// streams back model output. If thinking is enabled, reasoning text and final
+/// answer are surfaced in-order, with `<think>` / `</think>` markers wrapped
+/// around reasoning chunks. If thinking is disabled, we request
+/// `enable_thinking=false` via `chat_template_kwargs` so the server emits
+/// answer-only content. SSE/JSON protocol framing (role markers, finish_reason,
+/// keepalive lines, [DONE]) is stripped -- that's not model output.
 fn run_mlx_generation<FChunk>(
     config: &MlxConfig,
     prompt: &str,
@@ -466,7 +502,9 @@ where
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": config.max_tokens,
         "temperature": config.temperature,
-        "stream": true
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "chat_template_kwargs": {"enable_thinking": config.enable_thinking}
     });
 
     let response = ureq::post(&format!("{base_url}/v1/chat/completions"))
@@ -489,10 +527,15 @@ where
     }
     let mut mode = Mode::None;
 
-    let mut emit = |text: &str, full_text: &mut String, on_chunk: &mut FChunk| {
+    let emit = |text: &str, full_text: &mut String, on_chunk: &mut FChunk| {
         full_text.push_str(text);
         on_chunk(text);
     };
+
+    // Timing + token bookkeeping for the "N tokens, X tokens/sec" summary.
+    let generation_start = Instant::now();
+    let mut chunk_count: u64 = 0;
+    let mut usage_completion_tokens: Option<u64> = None;
 
     loop {
         let read_count = reader.read(&mut byte_buffer)?;
@@ -506,10 +549,14 @@ where
             let line: String = pending_line.drain(..=newline_pos).collect();
             match parse_sse_line(&line) {
                 Some(SseEvent::Reasoning(text)) => {
+                    if !config.enable_thinking {
+                        continue;
+                    }
                     if mode != Mode::Reasoning {
                         emit("<think>\n", &mut full_text, &mut on_chunk);
                         mode = Mode::Reasoning;
                     }
+                    chunk_count += 1;
                     emit(&text, &mut full_text, &mut on_chunk);
                 }
                 Some(SseEvent::Content(text)) => {
@@ -517,7 +564,11 @@ where
                         emit("\n</think>\n\n", &mut full_text, &mut on_chunk);
                     }
                     mode = Mode::Content;
+                    chunk_count += 1;
                     emit(&text, &mut full_text, &mut on_chunk);
+                }
+                Some(SseEvent::Usage { completion_tokens }) => {
+                    usage_completion_tokens = Some(completion_tokens);
                 }
                 Some(SseEvent::Done) => {
                     pending_line.clear();
@@ -529,17 +580,23 @@ where
 
     // Handle a final line with no trailing newline, if the stream ended that way.
     match parse_sse_line(&pending_line) {
-        Some(SseEvent::Reasoning(text)) => {
+        Some(SseEvent::Reasoning(text)) if config.enable_thinking => {
             if mode != Mode::Reasoning {
                 emit("<think>\n", &mut full_text, &mut on_chunk);
             }
+            chunk_count += 1;
             emit(&text, &mut full_text, &mut on_chunk);
         }
+        Some(SseEvent::Reasoning(_)) => {}
         Some(SseEvent::Content(text)) => {
             if mode == Mode::Reasoning {
                 emit("\n</think>\n\n", &mut full_text, &mut on_chunk);
             }
+            chunk_count += 1;
             emit(&text, &mut full_text, &mut on_chunk);
+        }
+        Some(SseEvent::Usage { completion_tokens }) => {
+            usage_completion_tokens = Some(completion_tokens);
         }
         _ => {}
     }
@@ -547,6 +604,17 @@ where
     if full_text.is_empty() {
         return Err(io::Error::other("mlx server returned no output").into());
     }
+
+    // Prefer the server's own token count (accurate); fall back to counting
+    // streamed chunks (each is roughly, not exactly, one token) if the
+    // server build doesn't send usage info.
+    let elapsed_secs = generation_start.elapsed().as_secs_f64().max(0.001);
+    let token_count = usage_completion_tokens.unwrap_or(chunk_count);
+    let tokens_per_sec = token_count as f64 / elapsed_secs;
+    let summary = format!(
+        "\n\n[{token_count} tokens generated in {elapsed_secs:.2}s -- {tokens_per_sec:.1} tokens/sec]"
+    );
+    emit(&summary, &mut full_text, &mut on_chunk);
 
     Ok(full_text)
 }
@@ -557,9 +625,9 @@ mod tests {
 
     #[test]
     fn section_prompt_includes_ticker() {
-        let prompt = build_section_prompt("AAPL", Some("MSFT"), None, "TAM / Market", "Objective");
-        assert!(prompt.contains("Ticker: AAPL"));
-        assert!(prompt.contains("Compare against MSFT"));
+        let prompt = build_section_prompt("AAPL", Some("MSFT"), None, "Macro Outlook", "Objective");
+        assert!(prompt.contains("Target ticker: AAPL"));
+        assert!(prompt.contains("Comparison anchor: MSFT"));
     }
 
     #[test]
@@ -572,6 +640,28 @@ mod tests {
         assert_eq!(effective_parallel_workers(10), MAX_MLX_PARALLEL_WORKERS);
         assert_eq!(effective_parallel_workers(0), 1);
         assert_eq!(effective_parallel_workers(2), 2);
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_true_values() {
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool("true"), Some(true));
+        assert_eq!(parse_env_bool("YES"), Some(true));
+        assert_eq!(parse_env_bool(" on "), Some(true));
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_false_values() {
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("false"), Some(false));
+        assert_eq!(parse_env_bool("NO"), Some(false));
+        assert_eq!(parse_env_bool(" off "), Some(false));
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_unknown_values() {
+        assert_eq!(parse_env_bool(""), None);
+        assert_eq!(parse_env_bool("maybe"), None);
     }
 
     #[test]
@@ -603,7 +693,10 @@ mod tests {
 
     #[test]
     fn parse_sse_line_detects_done_marker() {
-        assert!(matches!(parse_sse_line("data: [DONE]"), Some(SseEvent::Done)));
+        assert!(matches!(
+            parse_sse_line("data: [DONE]"),
+            Some(SseEvent::Done)
+        ));
     }
 
     #[test]
@@ -619,6 +712,15 @@ mod tests {
         // role marker with no content or reasoning -- should be skipped.
         let line = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
         assert!(parse_sse_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_usage_completion_tokens() {
+        let line = r#"data: {"choices":[],"usage":{"completion_tokens":42,"prompt_tokens":10,"total_tokens":52}}"#;
+        match parse_sse_line(line) {
+            Some(SseEvent::Usage { completion_tokens }) => assert_eq!(completion_tokens, 42),
+            _ => panic!("expected a Usage event"),
+        }
     }
 
     #[test]

@@ -2,10 +2,11 @@ pub(crate) mod controls;
 mod state;
 mod view;
 
+use crate::api::finnhub::{FinnhubSnapshot, fetch_finnhub_snapshot};
 use crate::api::mlx::{
     WorkerSectionChunk, WorkerSectionOutput, analyze_company_workers, preload_mlx_model,
 };
-use crate::api::yahoo::fetch_quote;
+use crate::api::yahoo::{build_analysis_context, fetch_quote};
 use crossterm::cursor;
 use crossterm::event::{self};
 use crossterm::execute;
@@ -31,6 +32,16 @@ enum AnalysisEvent {
         request_id: u64,
         ticker: String,
         text: String,
+    },
+    FinnhubStatus {
+        request_id: u64,
+        ticker: String,
+        text: String,
+    },
+    FinnhubComplete {
+        request_id: u64,
+        ticker: String,
+        result: Result<FinnhubSnapshot, String>,
     },
     SectionStream {
         request_id: u64,
@@ -65,12 +76,19 @@ fn queue_model_preload(analysis_tx: &Sender<AnalysisEvent>) {
     });
 }
 
-fn queue_analysis_request(app: &mut App, ticker: &str, analysis_tx: &Sender<AnalysisEvent>) {
+fn queue_analysis_request(
+    app: &mut App,
+    ticker: &str,
+    analysis_tx: &Sender<AnalysisEvent>,
+    snapshot_context: Option<String>,
+) {
     app.analysis_request_id = app.analysis_request_id.saturating_add(1);
     app.analysis_loading = true;
     app.analysis_error = None;
     app.mlx_status = Some("Bootstrapping worker pipeline...".to_string());
     app.reset_mlx_sections();
+    app.finnhub_status = Some("Preparing Finnhub dataset fetch...".to_string());
+    app.reset_finnhub_datasets();
 
     let request_id = app.analysis_request_id;
     let ticker_for_thread = ticker.to_string();
@@ -84,10 +102,47 @@ fn queue_analysis_request(app: &mut App, ticker: &str, analysis_tx: &Sender<Anal
         let ticker_for_stream = ticker_for_thread.clone();
         let tx_for_section = tx.clone();
         let ticker_for_section = ticker_for_thread.clone();
+        let tx_for_finnhub = tx.clone();
+        let ticker_for_finnhub = ticker_for_thread.clone();
+        let mut combined_context = snapshot_context.unwrap_or_default();
+
+        let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubStatus {
+            request_id,
+            ticker: ticker_for_finnhub.clone(),
+            text: "Fetching Finnhub datasets...".to_string(),
+        });
+
+        match fetch_finnhub_snapshot(&ticker_for_thread) {
+            Ok(snapshot) => {
+                if !combined_context.trim().is_empty() {
+                    combined_context.push_str("\n\n");
+                }
+                combined_context.push_str(&snapshot.context);
+                let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubComplete {
+                    request_id,
+                    ticker: ticker_for_finnhub.clone(),
+                    result: Ok(snapshot),
+                });
+            }
+            Err(err) => {
+                let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubComplete {
+                    request_id,
+                    ticker: ticker_for_finnhub.clone(),
+                    result: Err(err.to_string()),
+                });
+            }
+        }
+
+        let merged_context = if combined_context.trim().is_empty() {
+            None
+        } else {
+            Some(combined_context)
+        };
+
         let result = analyze_company_workers(
             &ticker_for_thread,
             comparison_ticker.as_deref(),
-            None,
+            merged_context.as_deref(),
             |status_text| {
                 let _ = tx_for_status.send(AnalysisEvent::Status {
                     request_id,
@@ -123,9 +178,11 @@ fn queue_analysis_request(app: &mut App, ticker: &str, analysis_tx: &Sender<Anal
 fn fetch_and_store_quote(app: &mut App, ticker: &str, analysis_tx: &Sender<AnalysisEvent>) {
     app.active_ticker = Some(ticker.to_string());
     app.error = None;
+    let mut snapshot_context: Option<String> = None;
 
     match fetch_quote(ticker) {
         Ok(meta) => {
+            snapshot_context = Some(build_analysis_context(&meta));
             app.quote = Some(meta);
         }
         Err(err) => {
@@ -134,7 +191,7 @@ fn fetch_and_store_quote(app: &mut App, ticker: &str, analysis_tx: &Sender<Analy
         }
     }
 
-    queue_analysis_request(app, ticker, analysis_tx);
+    queue_analysis_request(app, ticker, analysis_tx, snapshot_context);
 }
 
 fn apply_analysis_event(app: &mut App, event: AnalysisEvent) {
@@ -171,6 +228,44 @@ fn apply_analysis_event(app: &mut App, event: AnalysisEvent) {
 
             app.mlx_status = Some(text);
             app.analysis_error = None;
+        }
+        AnalysisEvent::FinnhubStatus {
+            request_id,
+            ticker,
+            text,
+        } => {
+            if request_id != app.analysis_request_id
+                || app.active_ticker.as_deref() != Some(ticker.as_str())
+            {
+                return;
+            }
+
+            app.finnhub_status = Some(text);
+        }
+        AnalysisEvent::FinnhubComplete {
+            request_id,
+            ticker,
+            result,
+        } => {
+            if request_id != app.analysis_request_id
+                || app.active_ticker.as_deref() != Some(ticker.as_str())
+            {
+                return;
+            }
+
+            match result {
+                Ok(snapshot) => {
+                    app.finnhub_status = Some(
+                        "Finnhub datasets loaded. Use the Finnhub tab to inspect each endpoint."
+                            .to_string(),
+                    );
+                    app.apply_finnhub_snapshot(snapshot);
+                }
+                Err(err) => {
+                    app.finnhub_status = Some(format!("Finnhub unavailable: {err}"));
+                    app.reset_finnhub_datasets();
+                }
+            }
         }
         AnalysisEvent::SectionStream {
             request_id,
