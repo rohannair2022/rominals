@@ -80,7 +80,7 @@ fn queue_analysis_request(
     app: &mut App,
     ticker: &str,
     analysis_tx: &Sender<AnalysisEvent>,
-    snapshot_context: Option<String>,
+    yahoo_context: Option<String>,
 ) {
     app.analysis_request_id = app.analysis_request_id.saturating_add(1);
     app.analysis_loading = true;
@@ -104,7 +104,8 @@ fn queue_analysis_request(
         let ticker_for_section = ticker_for_thread.clone();
         let tx_for_finnhub = tx.clone();
         let ticker_for_finnhub = ticker_for_thread.clone();
-        let mut combined_context = snapshot_context.unwrap_or_default();
+        let mut macro_context = String::new();
+        let mut micro_context = yahoo_context.unwrap_or_default();
 
         let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubStatus {
             request_id,
@@ -114,10 +115,13 @@ fn queue_analysis_request(
 
         match fetch_finnhub_snapshot(&ticker_for_thread) {
             Ok(snapshot) => {
-                if !combined_context.trim().is_empty() {
-                    combined_context.push_str("\n\n");
+                macro_context = snapshot.macro_context.clone();
+                if !snapshot.micro_context.trim().is_empty() {
+                    if !micro_context.trim().is_empty() {
+                        micro_context.push_str("\n\n");
+                    }
+                    micro_context.push_str(&snapshot.micro_context);
                 }
-                combined_context.push_str(&snapshot.context);
                 let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubComplete {
                     request_id,
                     ticker: ticker_for_finnhub.clone(),
@@ -133,16 +137,22 @@ fn queue_analysis_request(
             }
         }
 
-        let merged_context = if combined_context.trim().is_empty() {
+        let macro_prompt_context = if macro_context.trim().is_empty() {
             None
         } else {
-            Some(combined_context)
+            Some(macro_context)
+        };
+        let micro_prompt_context = if micro_context.trim().is_empty() {
+            None
+        } else {
+            Some(micro_context)
         };
 
         let result = analyze_company_workers(
             &ticker_for_thread,
             comparison_ticker.as_deref(),
-            merged_context.as_deref(),
+            macro_prompt_context.as_deref(),
+            micro_prompt_context.as_deref(),
             |status_text| {
                 let _ = tx_for_status.send(AnalysisEvent::Status {
                     request_id,

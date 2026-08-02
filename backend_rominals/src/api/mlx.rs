@@ -87,7 +87,8 @@ pub fn worker_section_titles() -> Vec<String> {
 pub fn analyze_company_workers<FStatus, FChunk, FSection>(
     ticker: &str,
     comparison_ticker: Option<&str>,
-    snapshot_context: Option<&str>,
+    macro_context: Option<&str>,
+    micro_context: Option<&str>,
     mut on_status: FStatus,
     mut on_chunk: FChunk,
     mut on_section: FSection,
@@ -115,7 +116,8 @@ where
         &config,
         ticker,
         comparison_ticker,
-        snapshot_context,
+        macro_context,
+        micro_context,
         |status| on_status(status),
         |chunk| on_chunk(chunk),
         |section| on_section(section),
@@ -246,7 +248,8 @@ fn run_parallel_workers<FStatus, FChunk, FSection>(
     config: &MlxConfig,
     ticker: &str,
     comparison_ticker: Option<&str>,
-    snapshot_context: Option<&str>,
+    macro_context: Option<&str>,
+    micro_context: Option<&str>,
     mut on_status: FStatus,
     mut on_chunk: FChunk,
     mut on_section: FSection,
@@ -259,13 +262,16 @@ where
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let parallel_workers = effective_parallel_workers(config.parallel_workers);
     let next_index = Arc::new(AtomicUsize::new(0));
+    let macro_context = macro_context.map(|value| value.to_string());
+    let micro_context = micro_context.map(|value| value.to_string());
 
     for _ in 0..parallel_workers {
         let tx = tx.clone();
         let config = config.clone();
         let ticker = ticker.to_string();
         let comparison_ticker = comparison_ticker.map(|value| value.to_string());
-        let snapshot_context = snapshot_context.map(|value| value.to_string());
+        let macro_context = macro_context.clone();
+        let micro_context = micro_context.clone();
         let next_index = Arc::clone(&next_index);
 
         thread::spawn(move || {
@@ -276,10 +282,15 @@ where
                 }
 
                 let (title, objective) = SECTION_DEFS[index];
+                let section_context = if index == 0 {
+                    macro_context.as_deref()
+                } else {
+                    micro_context.as_deref()
+                };
                 let worker_prompt = build_section_prompt(
                     &ticker,
                     comparison_ticker.as_deref(),
-                    snapshot_context.as_deref(),
+                    section_context,
                     title,
                     objective,
                 );
@@ -376,7 +387,7 @@ fn format_worker_status(
 fn build_section_prompt(
     ticker: &str,
     comparison_ticker: Option<&str>,
-    snapshot_context: Option<&str>,
+    section_context: Option<&str>,
     section_title: &str,
     objective: &str,
 ) -> String {
@@ -387,8 +398,8 @@ fn build_section_prompt(
             )
         })
         .unwrap_or_default();
-    let data_context = snapshot_context.unwrap_or(
-        "Structured fundamentals snapshot unavailable for this run. Use available context and avoid fabricating metrics.",
+    let data_context = section_context.unwrap_or(
+        "Section-scoped context unavailable for this run. Use available context and avoid fabricating metrics.",
     );
 
     format!(
@@ -398,7 +409,7 @@ Target ticker: {ticker}\n\
 Worker scope: {section_title}\n\
 Objective: {objective}\n\
 Execution rules:\n\
-- Start from the provided Yahoo context first; do not restate it verbatim.\n\
+- Start from the provided section context first; do not restate it verbatim.\n\
 - Apply institutional top-down/bottom-up thinking based on the worker scope.\n\
 - Translate the context into implications, tradeoffs, and risk-adjusted conclusions.\n\
 - If a metric is missing (for example P/S, EV, EV/EBITDA), explicitly mark it as unknown.\n\

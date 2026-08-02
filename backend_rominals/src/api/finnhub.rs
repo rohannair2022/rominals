@@ -1,13 +1,20 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::error::Error;
-use std::io;
+use std::io::{self, Read};
 use std::time::Duration;
 
 const DEFAULT_FINNHUB_BASE_URL: &str = "https://finnhub.io/api/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
 const FINNHUB_LOOKBACK_DAYS: i64 = 365;
 const CONTEXT_MAX_CHARS_PER_DATASET: usize = 1_200;
+const DEFAULT_LINK_CONTEXT_ENABLED: bool = true;
+const DEFAULT_LINK_CONTEXT_MAX_URLS_PER_SCOPE: usize = 2;
+const DEFAULT_LINK_CONTEXT_MAX_CHARS_PER_URL: usize = 700;
+const DEFAULT_LINK_CONTEXT_MAX_TOTAL_CHARS_PER_SCOPE: usize = 1_400;
+const DEFAULT_LINK_CONTEXT_TIMEOUT_SECS: u64 = 6;
+const DEFAULT_LINK_CONTEXT_MAX_FETCH_BYTES: usize = 90_000;
 const DATASET_DEFS: [(&str, &str); 13] = [
     ("stock_profile", "Stock Profile"),
     ("news", "Market News (General)"),
@@ -33,8 +40,19 @@ pub struct FinnhubDatasetSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct FinnhubSnapshot {
-    pub context: String,
+    pub macro_context: String,
+    pub micro_context: String,
     pub datasets: Vec<FinnhubDatasetSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct LinkContextConfig {
+    enabled: bool,
+    max_urls_per_scope: usize,
+    max_chars_per_url: usize,
+    max_total_chars_per_scope: usize,
+    timeout_secs: u64,
+    max_fetch_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -294,8 +312,33 @@ pub fn fetch_finnhub_snapshot(symbol: &str) -> Result<FinnhubSnapshot, Box<dyn E
         client.stock_usa_spending(&symbol, &from, &to)
     });
 
-    let context = build_finnhub_context(&symbol, &from, &to, &datasets);
-    Ok(FinnhubSnapshot { context, datasets })
+    let mut macro_context =
+        build_scoped_finnhub_context(&symbol, &from, &to, &datasets, "Macro", is_macro_dataset);
+    let mut micro_context =
+        build_scoped_finnhub_context(&symbol, &from, &to, &datasets, "Micro", is_micro_dataset);
+
+    let link_config = link_context_config_from_env();
+    if link_config.enabled {
+        let macro_link_context =
+            build_scoped_link_context(&datasets, "Macro", is_macro_dataset, &link_config);
+        if !macro_link_context.is_empty() {
+            macro_context.push_str("\n\n");
+            macro_context.push_str(&macro_link_context);
+        }
+
+        let micro_link_context =
+            build_scoped_link_context(&datasets, "Micro", is_micro_dataset, &link_config);
+        if !micro_link_context.is_empty() {
+            micro_context.push_str("\n\n");
+            micro_context.push_str(&micro_link_context);
+        }
+    }
+
+    Ok(FinnhubSnapshot {
+        macro_context,
+        micro_context,
+        datasets,
+    })
 }
 
 fn default_date_window() -> (String, String) {
@@ -331,18 +374,23 @@ where
     }
 }
 
-fn build_finnhub_context(
+fn build_scoped_finnhub_context<F>(
     symbol: &str,
     from: &str,
     to: &str,
     datasets: &[FinnhubDatasetSnapshot],
-) -> String {
-    let mut context = format!(
-        "Finnhub snapshot for {symbol} (rolling window {from} to {to})\n\
-Use this as supplemental context alongside Yahoo data."
-    );
+    scope_label: &str,
+    include_dataset: F,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    let mut context =
+        format!("{scope_label} Finnhub context for {symbol} (rolling window {from} to {to})");
+    let mut included_any = false;
 
-    for dataset in datasets {
+    for dataset in datasets.iter().filter(|d| include_dataset(&d.title)) {
+        included_any = true;
         let compact = truncate_for_context(&dataset.content, CONTEXT_MAX_CHARS_PER_DATASET);
         if dataset.is_error {
             context.push_str(&format!("\n\n{}:\nUnavailable. {}", dataset.title, compact));
@@ -351,13 +399,320 @@ Use this as supplemental context alongside Yahoo data."
         }
     }
 
+    if !included_any {
+        context.push_str("\n\nNo scoped Finnhub datasets available.");
+    }
+
     context
 }
 
+fn is_macro_dataset(title: &str) -> bool {
+    matches!(title, "Market News (General)" | "Market Sentiment")
+}
+
+fn is_micro_dataset(title: &str) -> bool {
+    matches!(
+        title,
+        "Stock Profile"
+            | "Company News"
+            | "Peers"
+            | "Insider Transactions"
+            | "Insider Sentiment"
+            | "Financials Reported"
+            | "SEC Filings"
+            | "Earnings Surprises"
+            | "USPTO Patents"
+            | "Stock Lobbying"
+            | "USA Spending"
+    )
+}
+
+fn link_context_config_from_env() -> LinkContextConfig {
+    let enabled = std::env::var("ROMINALS_LINK_CONTEXT_ENABLED")
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+        .unwrap_or(DEFAULT_LINK_CONTEXT_ENABLED);
+    let max_urls_per_scope = std::env::var("ROMINALS_LINK_CONTEXT_MAX_URLS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LINK_CONTEXT_MAX_URLS_PER_SCOPE);
+    let max_chars_per_url = std::env::var("ROMINALS_LINK_CONTEXT_MAX_CHARS_PER_URL")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LINK_CONTEXT_MAX_CHARS_PER_URL);
+    let max_total_chars_per_scope = std::env::var("ROMINALS_LINK_CONTEXT_MAX_TOTAL_CHARS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LINK_CONTEXT_MAX_TOTAL_CHARS_PER_SCOPE);
+    let timeout_secs = std::env::var("ROMINALS_LINK_CONTEXT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LINK_CONTEXT_TIMEOUT_SECS);
+    let max_fetch_bytes = std::env::var("ROMINALS_LINK_CONTEXT_MAX_FETCH_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LINK_CONTEXT_MAX_FETCH_BYTES);
+
+    LinkContextConfig {
+        enabled,
+        max_urls_per_scope,
+        max_chars_per_url,
+        max_total_chars_per_scope,
+        timeout_secs,
+        max_fetch_bytes,
+    }
+}
+
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn build_scoped_link_context<F>(
+    datasets: &[FinnhubDatasetSnapshot],
+    scope_label: &str,
+    include_dataset: F,
+    config: &LinkContextConfig,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    let candidate_urls = extract_scoped_urls(datasets, include_dataset, config);
+    if candidate_urls.is_empty() {
+        return String::new();
+    }
+
+    let http = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(config.timeout_secs))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return String::new(),
+    };
+
+    build_link_context_from_urls(scope_label, &candidate_urls, config, |url| {
+        fetch_url_snippet(&http, url, config)
+    })
+}
+
+fn build_link_context_from_urls<F>(
+    scope_label: &str,
+    urls: &[String],
+    config: &LinkContextConfig,
+    mut fetch_snippet: F,
+) -> String
+where
+    F: FnMut(&str) -> Result<String, io::Error>,
+{
+    let mut context = format!(
+        "{scope_label} link-derived context (capped fetch: <= {} links, <= {} chars total)",
+        config.max_urls_per_scope, config.max_total_chars_per_scope
+    );
+    let mut used_chars = 0usize;
+    let mut used_sources = 0usize;
+
+    for url in urls.iter().take(config.max_urls_per_scope) {
+        let remaining_chars = config.max_total_chars_per_scope.saturating_sub(used_chars);
+        if remaining_chars == 0 {
+            break;
+        }
+
+        let fetched = match fetch_snippet(url) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        if fetched.trim().is_empty() {
+            continue;
+        }
+
+        let source_char_cap = config.max_chars_per_url.min(remaining_chars);
+        let snippet = truncate_for_context(&fetched, source_char_cap);
+        let snippet_chars = snippet.chars().count();
+        if snippet_chars == 0 {
+            continue;
+        }
+
+        used_sources = used_sources.saturating_add(1);
+        used_chars = used_chars.saturating_add(snippet_chars);
+        context.push_str(&format!("\n\nSource {used_sources}: {url}\n{snippet}"));
+    }
+
+    if used_sources == 0 {
+        return String::new();
+    }
+
+    context
+}
+
+fn extract_scoped_urls<F>(
+    datasets: &[FinnhubDatasetSnapshot],
+    include_dataset: F,
+    config: &LinkContextConfig,
+) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    let candidate_limit = config.max_urls_per_scope.saturating_mul(4).max(4);
+
+    for dataset in datasets
+        .iter()
+        .filter(|dataset| !dataset.is_error && include_dataset(&dataset.title))
+    {
+        for url in extract_urls_from_json_content(&dataset.content) {
+            if seen.insert(url.clone()) {
+                urls.push(url);
+                if urls.len() >= candidate_limit {
+                    return urls;
+                }
+            }
+        }
+    }
+
+    urls
+}
+
+fn extract_urls_from_json_content(content: &str) -> Vec<String> {
+    let parsed: Value = match serde_json::from_str(content) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let mut urls = Vec::new();
+    collect_urls_from_value(&parsed, &mut urls);
+
+    let mut seen = HashSet::new();
+    urls.into_iter()
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
+}
+
+fn collect_urls_from_value(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_urls_from_value(item, urls);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                collect_urls_from_value(item, urls);
+            }
+        }
+        Value::String(text) => {
+            for url in extract_http_urls_from_text(text) {
+                urls.push(url);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_http_urls_from_text(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|part| {
+            let candidate = part.trim_matches(|ch: char| {
+                ch.is_ascii_punctuation() && ch != '/' && ch != ':' && ch != '?' && ch != '&'
+            });
+            if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                Some(candidate.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn fetch_url_snippet(
+    http: &reqwest::blocking::Client,
+    url: &str,
+    config: &LinkContextConfig,
+) -> Result<String, io::Error> {
+    let response = http.get(url).send().map_err(|err| {
+        io::Error::other(format!("failed to fetch link context from {url}: {err}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(io::Error::other(format!(
+            "non-success HTTP {} while fetching {url}",
+            response.status()
+        )));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mut body_bytes = Vec::new();
+    response
+        .take(config.max_fetch_bytes as u64)
+        .read_to_end(&mut body_bytes)?;
+    let body = String::from_utf8_lossy(&body_bytes);
+
+    if content_type.contains("application/json") {
+        let maybe_json: Result<Value, _> = serde_json::from_str(&body);
+        let json_text = maybe_json
+            .and_then(|value| serde_json::to_string_pretty(&value))
+            .unwrap_or_else(|_| body.to_string());
+        return Ok(normalize_whitespace(&json_text));
+    }
+
+    if content_type.contains("text/html") || body.contains("<html") || body.contains("<HTML") {
+        return Ok(normalize_whitespace(&strip_html_tags(&body)));
+    }
+
+    Ok(normalize_whitespace(&body))
+}
+
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn truncate_for_context(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= max_chars {
         return value.to_string();
+    }
+
+    if max_chars <= 40 {
+        return chars.into_iter().take(max_chars).collect();
     }
 
     let keep = max_chars.saturating_sub(40);
@@ -461,24 +816,102 @@ mod tests {
     }
 
     #[test]
-    fn build_finnhub_context_includes_dataset_names() {
+    fn truncate_for_context_respects_small_limits() {
+        let source = "abcdefghijklmnopqrstuvwxyz";
+        let truncated = truncate_for_context(source, 12);
+        assert_eq!(truncated.chars().count(), 12);
+    }
+
+    #[test]
+    fn scoped_context_filters_macro_and_micro_datasets() {
         let datasets = vec![
             FinnhubDatasetSnapshot {
-                title: "Stock Profile".to_string(),
-                content: "{\"name\":\"Apple\"}".to_string(),
+                title: "Market News (General)".to_string(),
+                content: "macro".to_string(),
                 is_error: false,
             },
             FinnhubDatasetSnapshot {
-                title: "SEC Filings".to_string(),
-                content: "Error: HTTP 403".to_string(),
-                is_error: true,
+                title: "Stock Profile".to_string(),
+                content: "micro".to_string(),
+                is_error: false,
             },
         ];
 
-        let context = build_finnhub_context("AAPL", "2025-01-01", "2025-12-31", &datasets);
-        assert!(context.contains("Finnhub snapshot for AAPL"));
-        assert!(context.contains("Stock Profile"));
-        assert!(context.contains("SEC Filings"));
-        assert!(context.contains("Unavailable."));
+        let macro_context = build_scoped_finnhub_context(
+            "AAPL",
+            "2025-01-01",
+            "2025-12-31",
+            &datasets,
+            "Macro",
+            is_macro_dataset,
+        );
+        let micro_context = build_scoped_finnhub_context(
+            "AAPL",
+            "2025-01-01",
+            "2025-12-31",
+            &datasets,
+            "Micro",
+            is_micro_dataset,
+        );
+
+        assert!(macro_context.contains("Market News (General)"));
+        assert!(!macro_context.contains("Stock Profile"));
+        assert!(micro_context.contains("Stock Profile"));
+        assert!(!micro_context.contains("Market News (General)"));
+    }
+
+    #[test]
+    fn extract_urls_from_json_content_collects_and_deduplicates() {
+        let content = r#"{
+          "url": "https://example.com/a",
+          "items": [
+            {"link": "https://example.com/a"},
+            {"link": "https://example.com/b?x=1"}
+          ],
+          "note": "see https://example.com/c for details"
+        }"#;
+
+        let urls = extract_urls_from_json_content(content);
+        assert_eq!(urls.len(), 3);
+        assert_eq!(urls[0], "https://example.com/a");
+        assert_eq!(urls[1], "https://example.com/b?x=1");
+        assert_eq!(urls[2], "https://example.com/c");
+    }
+
+    #[test]
+    fn build_link_context_from_urls_enforces_limits() {
+        let config = LinkContextConfig {
+            enabled: true,
+            max_urls_per_scope: 2,
+            max_chars_per_url: 50,
+            max_total_chars_per_scope: 120,
+            timeout_secs: 1,
+            max_fetch_bytes: 100,
+        };
+        let urls = vec![
+            "https://one.test".to_string(),
+            "https://two.test".to_string(),
+            "https://three.test".to_string(),
+        ];
+
+        let context =
+            build_link_context_from_urls(
+                "Macro",
+                &urls,
+                &config,
+                |_| Ok("abcdefghijk".to_string()),
+            );
+
+        assert!(context.contains("Source 1: https://one.test"));
+        assert!(context.contains("Source 2: https://two.test"));
+        assert!(!context.contains("Source 3: https://three.test"));
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_values() {
+        assert_eq!(parse_env_bool("true"), Some(true));
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("off"), Some(false));
+        assert_eq!(parse_env_bool("nope"), None);
     }
 }

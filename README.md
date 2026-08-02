@@ -37,7 +37,9 @@ cargo run --release -- AAPL
 ## Research pipeline configuration
 
 The app runs local `mlx-lm` generation workers on every ticker fetch and executes a two-section workflow (**Macro Outlook** + **Micro Outlook**) designed around standard top-down and bottom-up equity research framing.
-Each worker prompt now receives both Yahoo snapshot context and a full Finnhub multi-endpoint snapshot (profile/news/peers/insiders/financials/filings/earnings/alternative data), with per-endpoint truncation only to protect prompt size.
+The **Macro Outlook** worker now receives only macro-focused Finnhub context (general market news + market sentiment).
+The **Micro Outlook** worker receives Yahoo snapshot context plus micro-focused Finnhub context (profile/company news/peers/insiders/financials/filings/earnings/alternative data), with per-endpoint truncation to protect prompt size.
+If Finnhub datasets include links, the app also fetches a capped subset of those URLs and appends compact scraped snippets to prompt context (bounded by source count + character limits).
 By default it runs up to two workers concurrently (one per section).
 When no initial ticker is passed, the app preloads the MLX model at startup so the first fetch has less cold-start overhead.
 
@@ -58,11 +60,18 @@ export ROMINALS_MLX_PARALLEL_WORKERS=2
 export ROMINALS_MLX_ENABLE_THINKING=false
 export ROMINALS_FINNHUB_API_KEY=your_finnhub_key_here
 export ROMINALS_COMP_TICKER=MSFT
+export ROMINALS_LINK_CONTEXT_ENABLED=true
+export ROMINALS_LINK_CONTEXT_MAX_URLS=2
+export ROMINALS_LINK_CONTEXT_MAX_CHARS_PER_URL=700
+export ROMINALS_LINK_CONTEXT_MAX_TOTAL_CHARS=1400
+export ROMINALS_LINK_CONTEXT_TIMEOUT_SECS=6
+export ROMINALS_LINK_CONTEXT_MAX_FETCH_BYTES=90000
 ```
 
 - `ROMINALS_COMP_TICKER` is optional and enables "vs comp <ticker>" analysis context.
 - `ROMINALS_MLX_ENABLE_THINKING` defaults to `false`; set it to `true` to include reasoning output.
 - `ROMINALS_FINNHUB_API_KEY` (or `FINNHUB_API_KEY`) enables the Finnhub service client.
+- `ROMINALS_LINK_CONTEXT_*` controls optional URL scraping caps for LLM context enrichment.
 
 ## Finnhub service endpoints
 
