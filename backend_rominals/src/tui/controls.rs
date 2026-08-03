@@ -1,4 +1,4 @@
-use super::state::{App, AppTab};
+use super::state::App;
 use crate::api::yahoo::CandleRange;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -58,67 +58,47 @@ where
             true
         }
         (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-            app.prev_tab();
+            app.prev_finnhub_dataset();
             true
         }
         (KeyCode::BackTab, _) => {
-            app.prev_tab();
+            app.prev_finnhub_dataset();
             true
         }
         (KeyCode::Tab, _) => {
-            app.next_tab();
+            app.next_finnhub_dataset();
             true
         }
         (KeyCode::Left, _) => {
-            app.prev_tab();
+            app.prev_finnhub_dataset();
             true
         }
         (KeyCode::Right, _) => {
-            app.next_tab();
+            app.next_finnhub_dataset();
             true
         }
         (KeyCode::F(1), _) => {
-            app.set_tab_index(0);
+            app.set_active_finnhub_dataset_index(0);
             true
         }
         (KeyCode::F(2), _) => {
-            app.set_tab_index(1);
+            app.set_active_finnhub_dataset_index(1);
             true
         }
         (KeyCode::F(3), _) => {
-            app.set_tab_index(1);
+            app.set_active_finnhub_dataset_index(2);
             true
         }
         (KeyCode::Char('['), _) => {
-            match app.active_tab {
-                AppTab::Mlx => app.prev_mlx_section(),
-                AppTab::Finnhub => app.prev_finnhub_dataset(),
-                AppTab::Yahoo => {
-                    if app.prev_yahoo_range() {
-                        if let Some(ticker) = app.active_ticker.clone() {
-                            fetch_quote(app, &ticker, false);
-                        }
-                    }
-                }
-            }
+            app.prev_finnhub_dataset();
             true
         }
         (KeyCode::Char(']'), _) => {
-            match app.active_tab {
-                AppTab::Mlx => app.next_mlx_section(),
-                AppTab::Finnhub => app.next_finnhub_dataset(),
-                AppTab::Yahoo => {
-                    if app.next_yahoo_range() {
-                        if let Some(ticker) = app.active_ticker.clone() {
-                            fetch_quote(app, &ticker, false);
-                        }
-                    }
-                }
-            }
+            app.next_finnhub_dataset();
             true
         }
         (KeyCode::Char('d' | 'D'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Day) {
+            if app.set_yahoo_range(CandleRange::Day) {
                 if let Some(ticker) = app.active_ticker.clone() {
                     fetch_quote(app, &ticker, false);
                 }
@@ -126,7 +106,7 @@ where
             true
         }
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Week) {
+            if app.set_yahoo_range(CandleRange::Week) {
                 if let Some(ticker) = app.active_ticker.clone() {
                     fetch_quote(app, &ticker, false);
                 }
@@ -134,7 +114,7 @@ where
             true
         }
         (KeyCode::Char('m' | 'M'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Month) {
+            if app.set_yahoo_range(CandleRange::Month) {
                 if let Some(ticker) = app.active_ticker.clone() {
                     fetch_quote(app, &ticker, false);
                 }
@@ -142,7 +122,7 @@ where
             true
         }
         (KeyCode::Char('y' | 'Y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Year) {
+            if app.set_yahoo_range(CandleRange::Year) {
                 if let Some(ticker) = app.active_ticker.clone() {
                     fetch_quote(app, &ticker, false);
                 }
@@ -150,7 +130,7 @@ where
             true
         }
         (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::All) {
+            if app.set_yahoo_range(CandleRange::All) {
                 if let Some(ticker) = app.active_ticker.clone() {
                     fetch_quote(app, &ticker, false);
                 }
@@ -159,98 +139,38 @@ where
         }
         (KeyCode::Char(c @ '1'..='9'), _) => {
             let index = (c as usize) - ('1' as usize);
-            match app.active_tab {
-                AppTab::Mlx => {
-                    if index < app.mlx_sections.len() {
-                        app.set_active_mlx_section_index(index);
-                    }
-                }
-                AppTab::Finnhub => {
-                    if index < app.finnhub_datasets.len() {
-                        app.set_active_finnhub_dataset_index(index);
-                    }
-                }
-                AppTab::Yahoo => {}
+            if index < app.finnhub_datasets.len() {
+                app.set_active_finnhub_dataset_index(index);
             }
             true
         }
         (KeyCode::Up, _) => {
-            match app.active_tab {
-                AppTab::Mlx => {
-                    if let Some(section) = app.active_mlx_section_mut() {
-                        section.scroll = section.scroll.saturating_sub(1);
-                    }
-                }
-                AppTab::Finnhub => {
-                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
-                        dataset.scroll = dataset.scroll.saturating_sub(1);
-                    }
-                }
-                AppTab::Yahoo => {}
+            if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                dataset.scroll = dataset.scroll.saturating_sub(1);
             }
             true
         }
         (KeyCode::Down, _) => {
-            match app.active_tab {
-                AppTab::Mlx => {
-                    if let Some(section) = app.active_mlx_section_mut() {
-                        section.scroll = section.scroll.saturating_add(1);
-                    }
-                }
-                AppTab::Finnhub => {
-                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
-                        dataset.scroll = dataset.scroll.saturating_add(1);
-                    }
-                }
-                AppTab::Yahoo => {}
+            if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                dataset.scroll = dataset.scroll.saturating_add(1);
             }
             true
         }
         (KeyCode::PageUp, _) => {
-            match app.active_tab {
-                AppTab::Mlx => {
-                    if let Some(section) = app.active_mlx_section_mut() {
-                        section.scroll = section.scroll.saturating_sub(8);
-                    }
-                }
-                AppTab::Finnhub => {
-                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
-                        dataset.scroll = dataset.scroll.saturating_sub(8);
-                    }
-                }
-                AppTab::Yahoo => {}
+            if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                dataset.scroll = dataset.scroll.saturating_sub(8);
             }
             true
         }
         (KeyCode::PageDown, _) => {
-            match app.active_tab {
-                AppTab::Mlx => {
-                    if let Some(section) = app.active_mlx_section_mut() {
-                        section.scroll = section.scroll.saturating_add(8);
-                    }
-                }
-                AppTab::Finnhub => {
-                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
-                        dataset.scroll = dataset.scroll.saturating_add(8);
-                    }
-                }
-                AppTab::Yahoo => {}
+            if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                dataset.scroll = dataset.scroll.saturating_add(8);
             }
             true
         }
         (KeyCode::Home, _) => {
-            match app.active_tab {
-                AppTab::Mlx => {
-                    if let Some(section) = app.active_mlx_section_mut() {
-                        section.scroll = 0;
-                    }
-                }
-                AppTab::Finnhub => {
-                    if let Some(dataset) = app.active_finnhub_dataset_mut() {
-                        dataset.scroll = 0;
-                    }
-                }
-                AppTab::Yahoo => {}
+            if let Some(dataset) = app.active_finnhub_dataset_mut() {
+                dataset.scroll = 0;
             }
             true
         }
@@ -337,11 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_scrolls_mlx_section_with_arrow_keys() {
+    fn handle_event_scrolls_finnhub_dataset_with_arrow_keys() {
         let mut app = App::default();
-        app.active_tab = AppTab::Mlx;
-        if let Some(section) = app.active_mlx_section_mut() {
-            section.scroll = 2;
+        if let Some(dataset) = app.active_finnhub_dataset_mut() {
+            dataset.scroll = 2;
         }
 
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -352,75 +271,67 @@ mod tests {
             down,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.mlx_sections[0].scroll, 3);
+        assert_eq!(app.finnhub_datasets[0].scroll, 3);
         assert!(handle_event(
             &mut app,
             up,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.mlx_sections[0].scroll, 2);
+        assert_eq!(app.finnhub_datasets[0].scroll, 2);
     }
 
     #[test]
-    fn handle_event_switches_tabs() {
+    fn handle_event_cycles_finnhub_datasets_with_navigation_keys() {
         let mut app = App::default();
 
         let right = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let f2 = Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         let f3 = Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let backtab = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        let left = Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
 
         assert!(handle_event(
             &mut app,
             right,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.active_tab, AppTab::Finnhub);
+        assert_eq!(app.active_finnhub_dataset_index, 1);
         assert!(handle_event(
             &mut app,
             f2,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.active_tab, AppTab::Finnhub);
+        assert_eq!(app.active_finnhub_dataset_index, 1);
         assert!(handle_event(
             &mut app,
             f3,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.active_tab, AppTab::Finnhub);
+        assert_eq!(app.active_finnhub_dataset_index, 2);
         assert!(handle_event(
             &mut app,
             tab,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.active_tab, AppTab::Yahoo);
-    }
-
-    #[test]
-    fn handle_event_switches_mlx_worker_sections() {
-        let mut app = App::default();
-        app.active_tab = AppTab::Mlx;
-        let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        let jump = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-
+        assert_eq!(app.active_finnhub_dataset_index, 3);
         assert!(handle_event(
             &mut app,
-            next,
+            backtab,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.active_mlx_section_index, 1);
+        assert_eq!(app.active_finnhub_dataset_index, 2);
         assert!(handle_event(
             &mut app,
-            jump,
+            left,
             |_app, _ticker, _run_analysis| {}
         ));
-        assert_eq!(app.active_mlx_section_index, 1);
+        assert_eq!(app.active_finnhub_dataset_index, 1);
     }
 
     #[test]
     fn handle_event_switches_finnhub_datasets() {
         let mut app = App::default();
-        app.active_tab = AppTab::Finnhub;
         let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         let jump = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
 
@@ -439,9 +350,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_event_switches_yahoo_candle_range_without_analysis() {
+    fn handle_event_brackets_switch_finnhub_without_refreshing_yahoo() {
         let mut app = App::default();
-        app.active_tab = AppTab::Yahoo;
         app.active_ticker = Some("AAPL".to_string());
         let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         let called = Cell::new(false);
@@ -455,14 +365,14 @@ mod tests {
                 assert!(!run_analysis);
             }
         ));
-        assert!(called.get());
-        assert_eq!(app.yahoo_range, CandleRange::Week);
+        assert!(!called.get());
+        assert_eq!(app.active_finnhub_dataset_index, 1);
+        assert_eq!(app.yahoo_range, CandleRange::Day);
     }
 
     #[test]
     fn handle_event_keeps_typing_letters_for_ticker_input() {
         let mut app = App::default();
-        app.active_tab = AppTab::Yahoo;
         app.active_ticker = Some("MSFT".to_string());
         let event = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         let called = Cell::new(false);
@@ -481,7 +391,6 @@ mod tests {
     #[test]
     fn handle_event_switches_yahoo_range_with_ctrl_hotkey() {
         let mut app = App::default();
-        app.active_tab = AppTab::Yahoo;
         app.active_ticker = Some("AAPL".to_string());
         let event = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         let called = Cell::new(false);

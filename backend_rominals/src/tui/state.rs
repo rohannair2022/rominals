@@ -2,13 +2,6 @@ use crate::api::finnhub::{FinnhubSnapshot, finnhub_dataset_titles};
 use crate::api::mlx::worker_section_titles;
 use crate::api::yahoo::{Candle, CandleRange, Meta};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AppTab {
-    Yahoo,
-    Mlx,
-    Finnhub,
-}
-
 pub(crate) struct MlxSectionState {
     pub(crate) title: String,
     pub(crate) content: Option<String>,
@@ -31,7 +24,6 @@ pub(crate) struct YahooLivePoint {
 pub(crate) struct App {
     pub(crate) input: String,
     pub(crate) input_cursor_visible: bool,
-    pub(crate) active_tab: AppTab,
     pub(crate) active_ticker: Option<String>,
     pub(crate) quote: Option<Meta>,
     pub(crate) yahoo_candles: Vec<Candle>,
@@ -66,7 +58,6 @@ impl Default for App {
         Self {
             input: String::new(),
             input_cursor_visible: true,
-            active_tab: AppTab::Yahoo,
             active_ticker: None,
             quote: None,
             yahoo_candles: Vec::new(),
@@ -105,13 +96,6 @@ impl Default for App {
 impl App {
     const LIVE_WINDOW_MS: i64 = 10_000;
 
-    pub(crate) fn active_tab_index(&self) -> usize {
-        match self.active_tab {
-            AppTab::Yahoo => 0,
-            AppTab::Mlx | AppTab::Finnhub => 1,
-        }
-    }
-
     pub(crate) fn set_yahoo_range(&mut self, range: CandleRange) -> bool {
         if self.yahoo_range == range {
             return false;
@@ -148,22 +132,6 @@ impl App {
         let cutoff = now_ms.saturating_sub(Self::LIVE_WINDOW_MS);
         self.yahoo_live_prices
             .retain(|point| point.timestamp_ms >= cutoff);
-    }
-
-    pub(crate) fn set_tab_index(&mut self, index: usize) {
-        self.active_tab = match index {
-            0 => AppTab::Yahoo,
-            _ => AppTab::Finnhub,
-        };
-    }
-
-    pub(crate) fn next_tab(&mut self) {
-        self.set_tab_index((self.active_tab_index() + 1) % self.tab_count());
-    }
-
-    pub(crate) fn prev_tab(&mut self) {
-        let current = self.active_tab_index();
-        self.set_tab_index((current + self.tab_count() - 1) % self.tab_count());
     }
 
     pub(crate) fn reset_mlx_sections(&mut self) {
@@ -259,9 +227,5 @@ impl App {
     pub(crate) fn active_finnhub_dataset_mut(&mut self) -> Option<&mut FinnhubDatasetState> {
         self.finnhub_datasets
             .get_mut(self.active_finnhub_dataset_index)
-    }
-
-    fn tab_count(&self) -> usize {
-        2
     }
 }

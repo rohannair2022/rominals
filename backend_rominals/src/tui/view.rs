@@ -1,4 +1,4 @@
-use super::state::{App, AppTab, YahooLivePoint};
+use super::state::{App, YahooLivePoint};
 use crate::api::yahoo::{Candle, CandleRange, Meta};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -668,15 +668,24 @@ fn render_finnhub_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect)
     frame.render_widget(panel, dataset_chunks[1]);
 }
 
+fn render_market_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let hub_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+
+    render_yahoo_tab(frame, app, hub_chunks[0]);
+    render_finnhub_tab(frame, app, hub_chunks[1]);
+}
+
 pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     let outer_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(4),
-            Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
@@ -688,7 +697,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Enter fetch  Ctrl+R refresh  Yahoo auto-stream ~2s  Tab/←/→/F1-F2 tabs  [ ] or 1-9 sections  Ctrl+D/W/M/Y/A Yahoo range  Esc quit",
+            "  |  Enter fetch  Ctrl+R refresh  Yahoo auto-stream ~2s  Tab/Shift+Tab/←/→/[ ] cycle Finnhub dataset  1-9 jump dataset  Ctrl+D/W/M/Y/A Yahoo range  Esc quit",
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
@@ -717,26 +726,16 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     .wrap(Wrap { trim: true });
     frame.render_widget(input, outer_chunks[1]);
 
-    let tabs = Tabs::new(vec!["Yahoo", "Finnhub"])
-        .select(app.active_tab_index())
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::ALL).title("Tabs"));
-    frame.render_widget(tabs, outer_chunks[2]);
-
-    match app.active_tab {
-        AppTab::Yahoo => render_yahoo_tab(frame, app, outer_chunks[3]),
-        AppTab::Mlx => render_yahoo_tab(frame, app, outer_chunks[3]),
-        AppTab::Finnhub => render_finnhub_tab(frame, app, outer_chunks[3]),
-    }
+    render_market_view(frame, app, outer_chunks[2]);
 
     let status = if app.analysis_loading {
         Paragraph::new("Refreshing market data...")
             .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().borders(Borders::ALL).title("Status"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Status / Health"),
+            )
     } else {
         match &app.error {
             Some(error) => Paragraph::new(Line::from(vec![
@@ -746,25 +745,47 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 ),
                 Span::raw(error),
             ]))
-            .block(Block::default().borders(Borders::ALL).title("Status")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Status / Health"),
+            ),
             None => {
-                let active_status = match app.active_tab {
-                    AppTab::Finnhub => app.finnhub_status.as_deref(),
-                    AppTab::Yahoo | AppTab::Mlx => None,
-                };
-                let text = active_status.unwrap_or("Live stream active.");
-                let style = if active_status.is_some() {
-                    Style::default().fg(Color::Cyan)
+                let yahoo_health = if app.quote.is_some() {
+                    "ready"
                 } else {
-                    Style::default().fg(Color::Green)
+                    "waiting"
                 };
-                Paragraph::new(text)
-                    .style(style)
-                    .block(Block::default().borders(Borders::ALL).title("Status"))
+                let finnhub_ready = app
+                    .finnhub_datasets
+                    .iter()
+                    .any(|dataset| dataset.content.is_some() && !dataset.is_error);
+                let finnhub_health = if finnhub_ready { "ready" } else { "waiting" };
+                let finnhub_status = app
+                    .finnhub_status
+                    .as_deref()
+                    .unwrap_or("Finnhub datasets idle.");
+
+                let status_lines = vec![
+                    Line::from(format!(
+                        "Sources  Yahoo: {yahoo_health}  |  Finnhub: {finnhub_health}"
+                    )),
+                    Line::from(finnhub_status),
+                ];
+                let style = if finnhub_status.contains("unavailable") {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                Paragraph::new(status_lines).style(style).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Status / Health"),
+                )
             }
         }
     };
-    frame.render_widget(status, outer_chunks[4]);
+    frame.render_widget(status, outer_chunks[3]);
 }
 
 #[cfg(test)]

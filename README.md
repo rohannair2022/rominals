@@ -63,8 +63,9 @@ export ROMINALS_COMP_TICKER=MSFT
 
 - `Enter`: fetch ticker and run analysis pipeline
 - `Ctrl+R`: refresh current ticker and rerun analysis
-- `Tab` / `Shift+Tab` / `←` / `→`: switch Yahoo and Finnhub tabs
-- `[` / `]`: cycle range or dataset (depending on active tab)
+- `Tab` / `Shift+Tab` / `←` / `→` / `[` / `]`: cycle Finnhub datasets in the unified market view
+- `1-9`: jump directly to a Finnhub dataset
+- `Ctrl+D` / `Ctrl+W` / `Ctrl+M` / `Ctrl+Y` / `Ctrl+A`: change Yahoo candle range
 - `Esc` / `Ctrl+C` / `Ctrl+Q`: quit
 
 ## Project map
