@@ -6,7 +6,7 @@ use crate::api::finnhub::{FinnhubSnapshot, fetch_finnhub_snapshot};
 use crate::api::mlx::{
     WorkerSectionChunk, WorkerSectionOutput, analyze_company_workers, preload_mlx_model,
 };
-use crate::api::yahoo::{build_analysis_context, fetch_quote_snapshot};
+use crate::api::yahoo::{CandleRange, QuoteSnapshot, build_analysis_context, fetch_quote_snapshot};
 use chrono::Utc;
 use crossterm::cursor;
 use crossterm::event::{self};
@@ -46,6 +46,11 @@ enum AnalysisEvent {
         ticker: String,
         result: Result<FinnhubSnapshot, String>,
     },
+    YahooComplete {
+        request_id: u64,
+        ticker: String,
+        result: Result<QuoteSnapshot, String>,
+    },
     SectionStream {
         request_id: u64,
         ticker: String,
@@ -83,7 +88,7 @@ fn queue_analysis_request(
     app: &mut App,
     ticker: &str,
     analysis_tx: &Sender<AnalysisEvent>,
-    yahoo_context: Option<String>,
+    yahoo_range: CandleRange,
 ) {
     app.analysis_request_id = app.analysis_request_id.saturating_add(1);
     app.analysis_loading = true;
@@ -107,8 +112,21 @@ fn queue_analysis_request(
         let ticker_for_section = ticker_for_thread.clone();
         let tx_for_finnhub = tx.clone();
         let ticker_for_finnhub = ticker_for_thread.clone();
+        let tx_for_yahoo = tx.clone();
+        let ticker_for_yahoo_event = ticker_for_thread.clone();
+        let ticker_for_yahoo_fetch = ticker_for_thread.clone();
         let mut macro_context = String::new();
-        let mut micro_context = yahoo_context.unwrap_or_default();
+        let mut finnhub_micro_context = String::new();
+
+        let _ = tx_for_status.send(AnalysisEvent::Status {
+            request_id,
+            ticker: ticker_for_status.clone(),
+            text: "Fetching Yahoo snapshot + Finnhub datasets...".to_string(),
+        });
+        let yahoo_handle = thread::spawn(move || {
+            fetch_quote_snapshot(&ticker_for_yahoo_fetch, yahoo_range)
+                .map_err(|err| err.to_string())
+        });
 
         let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubStatus {
             request_id,
@@ -120,10 +138,7 @@ fn queue_analysis_request(
             Ok(snapshot) => {
                 macro_context = snapshot.macro_context.clone();
                 if !snapshot.micro_context.trim().is_empty() {
-                    if !micro_context.trim().is_empty() {
-                        micro_context.push_str("\n\n");
-                    }
-                    micro_context.push_str(&snapshot.micro_context);
+                    finnhub_micro_context = snapshot.micro_context.clone();
                 }
                 let _ = tx_for_finnhub.send(AnalysisEvent::FinnhubComplete {
                     request_id,
@@ -138,6 +153,37 @@ fn queue_analysis_request(
                     result: Err(err.to_string()),
                 });
             }
+        }
+
+        let mut micro_context = String::new();
+        let yahoo_result = match yahoo_handle.join() {
+            Ok(result) => result,
+            Err(_) => Err("Yahoo fetch thread panicked.".to_string()),
+        };
+
+        match yahoo_result {
+            Ok(snapshot) => {
+                micro_context = build_analysis_context(&snapshot.meta);
+                let _ = tx_for_yahoo.send(AnalysisEvent::YahooComplete {
+                    request_id,
+                    ticker: ticker_for_yahoo_event.clone(),
+                    result: Ok(snapshot),
+                });
+            }
+            Err(err) => {
+                let _ = tx_for_yahoo.send(AnalysisEvent::YahooComplete {
+                    request_id,
+                    ticker: ticker_for_yahoo_event.clone(),
+                    result: Err(err),
+                });
+            }
+        }
+
+        if !finnhub_micro_context.trim().is_empty() {
+            if !micro_context.trim().is_empty() {
+                micro_context.push_str("\n\n");
+            }
+            micro_context.push_str(&finnhub_micro_context);
         }
 
         let macro_prompt_context = if macro_context.trim().is_empty() {
@@ -197,11 +243,17 @@ fn fetch_and_store_quote(
     app.active_ticker = Some(ticker.to_string());
     app.error = None;
     app.prune_yahoo_live_prices(Utc::now().timestamp_millis());
-    let mut snapshot_context: Option<String> = None;
+
+    if run_analysis {
+        app.quote = None;
+        app.yahoo_candles.clear();
+        app.yahoo_live_prices.clear();
+        queue_analysis_request(app, ticker, analysis_tx, app.yahoo_range);
+        return;
+    }
 
     match fetch_quote_snapshot(ticker, app.yahoo_range) {
         Ok(snapshot) => {
-            snapshot_context = Some(build_analysis_context(&snapshot.meta));
             if let Some(price) = snapshot.meta.regular_market_price {
                 app.push_yahoo_live_price(Utc::now().timestamp_millis(), price);
             }
@@ -210,16 +262,7 @@ fn fetch_and_store_quote(
         }
         Err(err) => {
             app.error = Some(format!("Quote error: {err}"));
-            if run_analysis {
-                app.quote = None;
-                app.yahoo_candles.clear();
-                app.yahoo_live_prices.clear();
-            }
         }
-    }
-
-    if run_analysis {
-        queue_analysis_request(app, ticker, analysis_tx, snapshot_context);
     }
 }
 
@@ -293,6 +336,33 @@ fn apply_analysis_event(app: &mut App, event: AnalysisEvent) {
                 Err(err) => {
                     app.finnhub_status = Some(format!("Finnhub unavailable: {err}"));
                     app.reset_finnhub_datasets();
+                }
+            }
+        }
+        AnalysisEvent::YahooComplete {
+            request_id,
+            ticker,
+            result,
+        } => {
+            if request_id != app.analysis_request_id
+                || app.active_ticker.as_deref() != Some(ticker.as_str())
+            {
+                return;
+            }
+
+            match result {
+                Ok(snapshot) => {
+                    if let Some(price) = snapshot.meta.regular_market_price {
+                        app.push_yahoo_live_price(Utc::now().timestamp_millis(), price);
+                    }
+                    app.quote = Some(snapshot.meta);
+                    app.yahoo_candles = snapshot.candles;
+                }
+                Err(err) => {
+                    app.error = Some(format!("Quote error: {err}"));
+                    app.quote = None;
+                    app.yahoo_candles.clear();
+                    app.yahoo_live_prices.clear();
                 }
             }
         }

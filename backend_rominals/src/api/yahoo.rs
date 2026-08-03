@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use std::error::Error;
 use std::io;
-use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct ChartResponse {
@@ -137,7 +136,7 @@ impl Default for CandleRange {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QuoteSnapshot {
     pub meta: Meta,
     pub candles: Vec<Candle>,
@@ -299,8 +298,6 @@ pub fn fetch_quote_snapshot(
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (rust-yfinance/0.1)")
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
         .build()?;
 
     let resp = client

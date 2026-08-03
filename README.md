@@ -38,6 +38,7 @@ cargo run --release -- AAPL
 
 The app runs local `mlx-lm` generation workers on every ticker fetch and executes a two-section workflow (**Macro Outlook** + **Micro Outlook**) designed around standard top-down and bottom-up equity research framing.
 The LLM workflow uses a point-in-time Yahoo snapshot captured when you explicitly fetch (`Enter` / `Ctrl+R`) and does not rerun on the background Yahoo stream updates.
+On each explicit fetch, Yahoo snapshot retrieval and full Finnhub dataset retrieval run concurrently in the background worker pipeline.
 The **Macro Outlook** worker now receives only macro-focused Finnhub context (general market news).
 The **Micro Outlook** worker receives Yahoo snapshot context plus micro-focused Finnhub context (profile/company news/peers/insiders/financials/filings/earnings/alternative data), with per-endpoint truncation to protect prompt size.
 If Finnhub datasets include links, the app also fetches a capped subset of those URLs and appends compact scraped snippets to prompt context (bounded by source count + character limits).
@@ -65,7 +66,6 @@ export ROMINALS_LINK_CONTEXT_ENABLED=true
 export ROMINALS_LINK_CONTEXT_MAX_URLS=2
 export ROMINALS_LINK_CONTEXT_MAX_CHARS_PER_URL=700
 export ROMINALS_LINK_CONTEXT_MAX_TOTAL_CHARS=1400
-export ROMINALS_LINK_CONTEXT_TIMEOUT_SECS=6
 export ROMINALS_LINK_CONTEXT_MAX_FETCH_BYTES=90000
 ```
 

@@ -3,17 +3,14 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error;
 use std::io::{self, Read};
-use std::time::Duration;
 
 const DEFAULT_FINNHUB_BASE_URL: &str = "https://finnhub.io/api/v1";
-const DEFAULT_TIMEOUT_SECS: u64 = 15;
 const FINNHUB_LOOKBACK_DAYS: i64 = 365;
 const CONTEXT_MAX_CHARS_PER_DATASET: usize = 1_200;
 const DEFAULT_LINK_CONTEXT_ENABLED: bool = true;
 const DEFAULT_LINK_CONTEXT_MAX_URLS_PER_SCOPE: usize = 2;
 const DEFAULT_LINK_CONTEXT_MAX_CHARS_PER_URL: usize = 700;
 const DEFAULT_LINK_CONTEXT_MAX_TOTAL_CHARS_PER_SCOPE: usize = 1_400;
-const DEFAULT_LINK_CONTEXT_TIMEOUT_SECS: u64 = 6;
 const DEFAULT_LINK_CONTEXT_MAX_FETCH_BYTES: usize = 90_000;
 const DATASET_DEFS: [(&str, &str); 12] = [
     ("stock_profile", "Stock Profile"),
@@ -50,7 +47,6 @@ struct LinkContextConfig {
     max_urls_per_scope: usize,
     max_chars_per_url: usize,
     max_total_chars_per_scope: usize,
-    timeout_secs: u64,
     max_fetch_bytes: usize,
 }
 
@@ -84,10 +80,7 @@ impl FinnhubClient {
     ) -> Result<Self, Box<dyn Error>> {
         let api_key = non_empty_param("api_key", &api_key.into())?;
         let base_url = non_empty_param("base_url", &base_url.into())?;
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(5))
-            .build()?;
+        let http = reqwest::blocking::Client::builder().build()?;
 
         Ok(Self {
             api_key,
@@ -440,11 +433,6 @@ fn link_context_config_from_env() -> LinkContextConfig {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_LINK_CONTEXT_MAX_TOTAL_CHARS_PER_SCOPE);
-    let timeout_secs = std::env::var("ROMINALS_LINK_CONTEXT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_LINK_CONTEXT_TIMEOUT_SECS);
     let max_fetch_bytes = std::env::var("ROMINALS_LINK_CONTEXT_MAX_FETCH_BYTES")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -456,7 +444,6 @@ fn link_context_config_from_env() -> LinkContextConfig {
         max_urls_per_scope,
         max_chars_per_url,
         max_total_chars_per_scope,
-        timeout_secs,
         max_fetch_bytes,
     }
 }
@@ -484,11 +471,7 @@ where
         return String::new();
     }
 
-    let http = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
-        .connect_timeout(Duration::from_secs(3))
-        .build()
-    {
+    let http = match reqwest::blocking::Client::builder().build() {
         Ok(client) => client,
         Err(_) => return String::new(),
     };
@@ -877,7 +860,6 @@ mod tests {
             max_urls_per_scope: 2,
             max_chars_per_url: 50,
             max_total_chars_per_scope: 120,
-            timeout_secs: 1,
             max_fetch_bytes: 100,
         };
         let urls = vec![
