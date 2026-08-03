@@ -4,11 +4,10 @@ Rominals is now focused on a terminal user interface (TUI) for live ticker resea
 Each ticker fetch now runs a stronger pipeline:
 1. live quote from Yahoo Finance,
 2. parallel MLX worker passes,
-3. worker-by-worker output rendered in dedicated MLX sections.
+3. worker-by-worker output generated in the background for internal LLM use.
 
-The terminal now uses three tabs:
+The terminal now uses two visible tabs:
 - **Yahoo**
-- **MLX**
 - **Finnhub**
 
 ## Run the TUI
@@ -28,16 +27,18 @@ cargo run --release -- AAPL
 
 - Type a ticker and press `Enter` to fetch data
 - Press `Ctrl+R` to refresh the current symbol
-- Switch tabs with `Tab`, `Shift+Tab`, `←` / `→`, or `F1` / `F2` / `F3`
-- In MLX/Finnhub tabs, switch sections with `[` / `]` or `1`-`9`
-- Use `↑` / `↓` (or `PgUp` / `PgDn`) to scroll the active MLX/Finnhub section
-- MLX section output streams live while workers generate (token flow is incremental)
+- Yahoo quote + charts auto-refresh in the terminal every ~2 seconds (live stream view keeps a rolling 10s window)
+- Switch tabs with `Tab`, `Shift+Tab`, `←` / `→`, or `F1` / `F2`
+- In the Yahoo tab, cycle candle ranges with `[` / `]` or jump with `Ctrl+D` / `Ctrl+W` / `Ctrl+M` / `Ctrl+Y` / `Ctrl+A`
+- In the Finnhub tab, switch datasets with `[` / `]` or `1`-`9`
+- Use `↑` / `↓` (or `PgUp` / `PgDn`) to scroll the active Finnhub dataset
 - Press `Esc`, `Ctrl+C`, or `Ctrl+Q` to quit
 
 ## Research pipeline configuration
 
 The app runs local `mlx-lm` generation workers on every ticker fetch and executes a two-section workflow (**Macro Outlook** + **Micro Outlook**) designed around standard top-down and bottom-up equity research framing.
-The **Macro Outlook** worker now receives only macro-focused Finnhub context (general market news + market sentiment).
+The LLM workflow uses a point-in-time Yahoo snapshot captured when you explicitly fetch (`Enter` / `Ctrl+R`) and does not rerun on the background Yahoo stream updates.
+The **Macro Outlook** worker now receives only macro-focused Finnhub context (general market news).
 The **Micro Outlook** worker receives Yahoo snapshot context plus micro-focused Finnhub context (profile/company news/peers/insiders/financials/filings/earnings/alternative data), with per-endpoint truncation to protect prompt size.
 If Finnhub datasets include links, the app also fetches a capped subset of those URLs and appends compact scraped snippets to prompt context (bounded by source count + character limits).
 By default it runs up to two workers concurrently (one per section).
@@ -79,7 +80,6 @@ export ROMINALS_LINK_CONTEXT_MAX_FETCH_BYTES=90000
 - `stock_profile`
 - `news`
 - `company_news`
-- `market_sentiment`
 - `peers`
 - `insider_transactions`
 - `insider_sentiments`
@@ -91,7 +91,7 @@ export ROMINALS_LINK_CONTEXT_MAX_FETCH_BYTES=90000
 - `stock_lobbying`
 - `stock_usa_spending`
 
-In the **Finnhub** tab, `Market Sentiment` and `Insider Sentiment` now render in compact ASCII tables for easier terminal scanning.
+In the **Finnhub** tab, `Insider Sentiment` renders in a compact ASCII table for easier terminal scanning.
 
 For isolated Python dependencies, use a dedicated venv and point the runtime to it:
 

@@ -1,10 +1,13 @@
-use super::state::{App, AppTab};
-use crate::api::yahoo::Meta;
+use super::state::{App, AppTab, YahooLivePoint};
+use crate::api::yahoo::{Candle, CandleRange, Meta};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Tabs, Wrap,
+};
 use serde_json::Value;
 
 fn money(v: Option<f64>) -> String {
@@ -186,95 +189,6 @@ fn ascii_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     lines.join("\n")
 }
 
-fn format_market_sentiment_table(content: &str) -> Option<String> {
-    let payload: Value = serde_json::from_str(content).ok()?;
-    let symbol = payload
-        .get("symbol")
-        .and_then(Value::as_str)
-        .unwrap_or("n/a")
-        .to_string();
-    let sentiment = payload.get("sentiment");
-    let buzz = payload.get("buzz");
-
-    let rows = vec![
-        vec![
-            "Company News Score".to_string(),
-            format_float(payload.get("companyNewsScore").and_then(Value::as_f64), 3),
-        ],
-        vec![
-            "Sector Avg News Score".to_string(),
-            format_float(
-                payload
-                    .get("sectorAverageNewsScore")
-                    .and_then(Value::as_f64),
-                3,
-            ),
-        ],
-        vec![
-            "Bullish Percent".to_string(),
-            format!(
-                "{}%",
-                format_float(
-                    sentiment
-                        .and_then(|value| value.get("bullishPercent"))
-                        .and_then(Value::as_f64),
-                    1
-                )
-            ),
-        ],
-        vec![
-            "Bearish Percent".to_string(),
-            format!(
-                "{}%",
-                format_float(
-                    sentiment
-                        .and_then(|value| value.get("bearishPercent"))
-                        .and_then(Value::as_f64),
-                    1
-                )
-            ),
-        ],
-        vec![
-            "Sector Avg Bullish".to_string(),
-            format!(
-                "{}%",
-                format_float(
-                    payload
-                        .get("sectorAverageBullishPercent")
-                        .and_then(Value::as_f64),
-                    1
-                )
-            ),
-        ],
-        vec![
-            "Articles Last Week".to_string(),
-            buzz.and_then(|value| value.get("articlesInLastWeek"))
-                .and_then(Value::as_i64)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "n/a".to_string()),
-        ],
-        vec![
-            "Buzz This Week".to_string(),
-            format_float(
-                buzz.and_then(|value| value.get("buzz"))
-                    .and_then(Value::as_f64),
-                3,
-            ),
-        ],
-        vec![
-            "Weekly Avg Buzz".to_string(),
-            format_float(
-                buzz.and_then(|value| value.get("weeklyAverage"))
-                    .and_then(Value::as_f64),
-                3,
-            ),
-        ],
-    ];
-
-    let table = ascii_table(&["Metric", "Value"], &rows);
-    Some(format!("Market Sentiment ({symbol})\n{table}"))
-}
-
 fn format_insider_sentiment_table(content: &str) -> Option<String> {
     let payload: Value = serde_json::from_str(content).ok()?;
     let symbol = payload
@@ -327,13 +241,122 @@ fn format_insider_sentiment_table(content: &str) -> Option<String> {
 
 fn format_finnhub_dataset_body(title: &str, content: &str) -> Option<String> {
     match title {
-        "Market Sentiment" => format_market_sentiment_table(content),
         "Insider Sentiment" => format_insider_sentiment_table(content),
         _ => None,
     }
 }
 
+fn downsample_candles(candles: &[Candle], max_points: usize) -> Vec<Candle> {
+    if max_points == 0 || candles.is_empty() {
+        return Vec::new();
+    }
+    if candles.len() <= max_points {
+        return candles.to_vec();
+    }
+
+    let mut sampled = Vec::with_capacity(max_points);
+    for bucket in 0..max_points {
+        let start = bucket * candles.len() / max_points;
+        let mut end = (bucket + 1) * candles.len() / max_points;
+        if end <= start {
+            end = (start + 1).min(candles.len());
+        }
+        let window = &candles[start..end];
+        let first = window[0];
+        let last = window[window.len() - 1];
+        let high = window
+            .iter()
+            .map(|candle| candle.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let low = window
+            .iter()
+            .map(|candle| candle.low)
+            .fold(f64::INFINITY, f64::min);
+
+        sampled.push(Candle {
+            timestamp: last.timestamp,
+            open: first.open,
+            high,
+            low,
+            close: last.close,
+        });
+    }
+
+    sampled
+}
+
+fn historical_flow_points(candles: &[Candle], max_points: usize) -> Vec<(f64, f64)> {
+    let sampled = downsample_candles(candles, max_points);
+    let Some(first_close) = sampled.first().map(|candle| candle.close) else {
+        return Vec::new();
+    };
+
+    if first_close.abs() <= f64::EPSILON {
+        return sampled
+            .into_iter()
+            .enumerate()
+            .map(|(index, candle)| (index as f64, candle.close))
+            .collect();
+    }
+
+    sampled
+        .into_iter()
+        .enumerate()
+        .map(|(index, candle)| {
+            (
+                index as f64,
+                ((candle.close - first_close) / first_close) * 100.0,
+            )
+        })
+        .collect()
+}
+
+fn live_price_points(points: &[YahooLivePoint]) -> Vec<(f64, f64)> {
+    let Some(latest_ts) = points.last().map(|point| point.timestamp_ms as f64) else {
+        return Vec::new();
+    };
+
+    points
+        .iter()
+        .map(|point| {
+            (
+                ((point.timestamp_ms as f64 - latest_ts) / 1_000.0).max(-10.0),
+                point.price,
+            )
+        })
+        .collect()
+}
+
+fn padded_bounds(values: &[f64]) -> Option<(f64, f64)> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+
+    if (max - min).abs() <= f64::EPSILON {
+        let pad = if min.abs() <= 1.0 {
+            0.5
+        } else {
+            min.abs() * 0.01
+        };
+        return Some((min - pad, max + pad));
+    }
+
+    let pad = (max - min) * 0.05;
+    Some((min - pad, max + pad))
+}
+
 fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let yahoo_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+
     if let Some(meta) = &app.quote {
         let quote = Table::new(
             quote_rows(meta),
@@ -345,17 +368,163 @@ fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .borders(Borders::ALL)
                 .title(format!("Yahoo — {}", display_name(meta))),
         );
-        frame.render_widget(quote, area);
+        frame.render_widget(quote, yahoo_chunks[0]);
     } else {
         let placeholder =
             Paragraph::new("No Yahoo quote loaded yet. Enter a ticker and press Enter.")
                 .style(Style::default().fg(Color::DarkGray))
                 .block(Block::default().borders(Borders::ALL).title("Yahoo"))
                 .wrap(Wrap { trim: true });
-        frame.render_widget(placeholder, area);
+        frame.render_widget(placeholder, yahoo_chunks[0]);
     }
+
+    let chart_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(12)])
+        .split(yahoo_chunks[1]);
+    let plot_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chart_chunks[1]);
+
+    let range_tabs = Tabs::new(
+        CandleRange::ORDERED
+            .iter()
+            .map(|range| range.tab_label())
+            .collect::<Vec<_>>(),
+    )
+    .select(app.yahoo_range_index())
+    .highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Candles [ ] / Ctrl+D/W/M/Y/A"),
+    );
+    frame.render_widget(range_tabs, chart_chunks[0]);
+
+    let live_points = live_price_points(&app.yahoo_live_prices);
+    if live_points.len() < 2 {
+        let live_placeholder = Paragraph::new(
+            "Waiting for live Yahoo ticks... (updates every ~2 seconds, rolling 10s window)",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Live 10s Stream"),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(live_placeholder, plot_chunks[0]);
+    } else {
+        let live_prices: Vec<f64> = live_points.iter().map(|(_, y)| *y).collect();
+        let (live_min, live_max) = padded_bounds(&live_prices).unwrap_or((0.0, 1.0));
+        let live_first = live_points.first().map(|(_, y)| *y).unwrap_or(live_min);
+        let live_last = live_points.last().map(|(_, y)| *y).unwrap_or(live_max);
+        let live_style = if live_last >= live_first {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Red)
+        };
+
+        let live_dataset = Dataset::default()
+            .name("Live Price")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(live_style)
+            .data(&live_points);
+
+        let live_chart = Chart::new(vec![live_dataset])
+            .x_axis(
+                Axis::default()
+                    .title("time")
+                    .bounds([-10.0, 0.0])
+                    .labels(vec![Span::raw("-10s"), Span::raw("-5s"), Span::raw("now")]),
+            )
+            .y_axis(
+                Axis::default()
+                    .title("price")
+                    .bounds([live_min, live_max])
+                    .labels(vec![
+                        Span::raw(format!("{live_min:.2}")),
+                        Span::raw(format!("{live_max:.2}")),
+                    ]),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Live 10s Stream"),
+            );
+        frame.render_widget(live_chart, plot_chunks[0]);
+    }
+
+    let history_points = historical_flow_points(
+        &app.yahoo_candles,
+        plot_chunks[1].width.saturating_mul(4).max(20) as usize,
+    );
+    if history_points.len() < 2 {
+        let history_placeholder =
+            Paragraph::new("No chart history loaded yet. Fetch a ticker to load Yahoo history.")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Historical Flow"),
+                )
+                .wrap(Wrap { trim: true });
+        frame.render_widget(history_placeholder, plot_chunks[1]);
+    } else {
+        let flow_values: Vec<f64> = history_points.iter().map(|(_, y)| *y).collect();
+        let (history_min, history_max) = padded_bounds(&flow_values).unwrap_or((-1.0, 1.0));
+        let history_first = history_points.first().map(|(_, y)| *y).unwrap_or(0.0);
+        let history_last = history_points
+            .last()
+            .map(|(_, y)| *y)
+            .unwrap_or(history_max);
+        let history_style = if history_last >= history_first {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Red)
+        };
+
+        let history_dataset = Dataset::default()
+            .name("Flow %")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(history_style)
+            .data(&history_points);
+
+        let history_title = format!(
+            "{} flow ({})  now {:+.2}%",
+            app.active_ticker.as_deref().unwrap_or("n/a"),
+            app.yahoo_range.title_label(),
+            history_last
+        );
+        let history_chart = Chart::new(vec![history_dataset])
+            .x_axis(
+                Axis::default()
+                    .title("samples")
+                    .bounds([0.0, (history_points.len() - 1) as f64])
+                    .labels(vec![Span::raw("start"), Span::raw("mid"), Span::raw("now")]),
+            )
+            .y_axis(
+                Axis::default()
+                    .title("% vs first")
+                    .bounds([history_min, history_max])
+                    .labels(vec![
+                        Span::raw(format!("{history_min:+.2}%")),
+                        Span::raw(format!("{history_max:+.2}%")),
+                    ]),
+            )
+            .block(Block::default().borders(Borders::ALL).title(history_title));
+        frame.render_widget(history_chart, plot_chunks[1]);
+    };
 }
 
+#[allow(dead_code)]
 fn render_mlx_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let section_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -519,7 +688,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Enter fetch  Ctrl+R refresh  Tab/←/→/F1-F3 tabs  [ ] or 1-9 sections  Esc quit",
+            "  |  Enter fetch  Ctrl+R refresh  Yahoo auto-stream ~2s  Tab/←/→/F1-F2 tabs  [ ] or 1-9 sections  Ctrl+D/W/M/Y/A Yahoo range  Esc quit",
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
@@ -548,7 +717,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     .wrap(Wrap { trim: true });
     frame.render_widget(input, outer_chunks[1]);
 
-    let tabs = Tabs::new(vec!["Yahoo", "MLX", "Finnhub"])
+    let tabs = Tabs::new(vec!["Yahoo", "Finnhub"])
         .select(app.active_tab_index())
         .highlight_style(
             Style::default()
@@ -560,12 +729,12 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
 
     match app.active_tab {
         AppTab::Yahoo => render_yahoo_tab(frame, app, outer_chunks[3]),
-        AppTab::Mlx => render_mlx_tab(frame, app, outer_chunks[3]),
+        AppTab::Mlx => render_yahoo_tab(frame, app, outer_chunks[3]),
         AppTab::Finnhub => render_finnhub_tab(frame, app, outer_chunks[3]),
     }
 
     let status = if app.analysis_loading {
-        Paragraph::new("Fetching quote + Finnhub datasets + running MLX workers...")
+        Paragraph::new("Refreshing market data...")
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL).title("Status"))
     } else {
@@ -581,9 +750,9 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
             None => {
                 let active_status = match app.active_tab {
                     AppTab::Finnhub => app.finnhub_status.as_deref(),
-                    AppTab::Yahoo | AppTab::Mlx => app.mlx_status.as_deref(),
+                    AppTab::Yahoo | AppTab::Mlx => None,
                 };
-                let text = active_status.unwrap_or("Ready.");
+                let text = active_status.unwrap_or("Live stream active.");
                 let style = if active_status.is_some() {
                     Style::default().fg(Color::Cyan)
                 } else {
@@ -647,30 +816,6 @@ mod tests {
     }
 
     #[test]
-    fn market_sentiment_renders_table() {
-        let json = r#"{
-            "symbol": "AAPL",
-            "companyNewsScore": 0.42,
-            "sectorAverageNewsScore": 0.38,
-            "sectorAverageBullishPercent": 61.5,
-            "sentiment": {
-                "bullishPercent": 66.2,
-                "bearishPercent": 33.8
-            },
-            "buzz": {
-                "articlesInLastWeek": 123,
-                "buzz": 1.4,
-                "weeklyAverage": 1.1
-            }
-        }"#;
-
-        let table = format_market_sentiment_table(json).unwrap();
-        assert!(table.contains("Market Sentiment (AAPL)"));
-        assert!(table.contains("Company News Score"));
-        assert!(table.contains("Bullish Percent"));
-    }
-
-    #[test]
     fn insider_sentiment_renders_latest_first() {
         let json = r#"{
             "symbol": "AAPL",
@@ -684,5 +829,60 @@ mod tests {
         let march_index = table.find("2024 | 03").unwrap();
         let feb_index = table.find("2024 | 02").unwrap();
         assert!(march_index < feb_index);
+    }
+
+    #[test]
+    fn historical_flow_points_are_percent_change_series() {
+        let candles = vec![
+            Candle {
+                timestamp: 1,
+                open: 10.0,
+                high: 11.0,
+                low: 9.0,
+                close: 10.5,
+            },
+            Candle {
+                timestamp: 2,
+                open: 10.5,
+                high: 11.2,
+                low: 9.7,
+                close: 10.0,
+            },
+        ];
+
+        let points = historical_flow_points(&candles, 8);
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0], (0.0, 0.0));
+        assert!((points[1].1 + 4.7619).abs() < 0.001);
+    }
+
+    #[test]
+    fn live_price_points_anchor_latest_as_now() {
+        let points = vec![
+            YahooLivePoint {
+                timestamp_ms: 10_000,
+                price: 99.5,
+            },
+            YahooLivePoint {
+                timestamp_ms: 12_000,
+                price: 100.0,
+            },
+            YahooLivePoint {
+                timestamp_ms: 15_000,
+                price: 100.2,
+            },
+        ];
+
+        let live = live_price_points(&points);
+        assert_eq!(live.len(), 3);
+        assert_eq!(live.last().unwrap().0, 0.0);
+        assert!(live.first().unwrap().0 <= -5.0);
+    }
+
+    #[test]
+    fn padded_bounds_adds_padding_for_flat_series() {
+        let bounds = padded_bounds(&[100.0, 100.0, 100.0]).unwrap();
+        assert!(bounds.0 < 100.0);
+        assert!(bounds.1 > 100.0);
     }
 }

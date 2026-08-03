@@ -6,7 +6,8 @@ use crate::api::finnhub::{FinnhubSnapshot, fetch_finnhub_snapshot};
 use crate::api::mlx::{
     WorkerSectionChunk, WorkerSectionOutput, analyze_company_workers, preload_mlx_model,
 };
-use crate::api::yahoo::{build_analysis_context, fetch_quote};
+use crate::api::yahoo::{build_analysis_context, fetch_quote_snapshot};
+use chrono::Utc;
 use crossterm::cursor;
 use crossterm::event::{self};
 use crossterm::execute;
@@ -18,8 +19,10 @@ use std::error::Error;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use view::draw_ui;
+
+const YAHOO_STREAM_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 enum AnalysisEvent {
     PreloadStatus {
@@ -185,23 +188,39 @@ fn queue_analysis_request(
     });
 }
 
-fn fetch_and_store_quote(app: &mut App, ticker: &str, analysis_tx: &Sender<AnalysisEvent>) {
+fn fetch_and_store_quote(
+    app: &mut App,
+    ticker: &str,
+    analysis_tx: &Sender<AnalysisEvent>,
+    run_analysis: bool,
+) {
     app.active_ticker = Some(ticker.to_string());
     app.error = None;
+    app.prune_yahoo_live_prices(Utc::now().timestamp_millis());
     let mut snapshot_context: Option<String> = None;
 
-    match fetch_quote(ticker) {
-        Ok(meta) => {
-            snapshot_context = Some(build_analysis_context(&meta));
-            app.quote = Some(meta);
+    match fetch_quote_snapshot(ticker, app.yahoo_range) {
+        Ok(snapshot) => {
+            snapshot_context = Some(build_analysis_context(&snapshot.meta));
+            if let Some(price) = snapshot.meta.regular_market_price {
+                app.push_yahoo_live_price(Utc::now().timestamp_millis(), price);
+            }
+            app.quote = Some(snapshot.meta);
+            app.yahoo_candles = snapshot.candles;
         }
         Err(err) => {
             app.error = Some(format!("Quote error: {err}"));
-            app.quote = None;
+            if run_analysis {
+                app.quote = None;
+                app.yahoo_candles.clear();
+                app.yahoo_live_prices.clear();
+            }
         }
     }
 
-    queue_analysis_request(app, ticker, analysis_tx, snapshot_context);
+    if run_analysis {
+        queue_analysis_request(app, ticker, analysis_tx, snapshot_context);
+    }
 }
 
 fn apply_analysis_event(app: &mut App, event: AnalysisEvent) {
@@ -356,9 +375,11 @@ pub(crate) fn run_tui(initial_ticker: Option<String>) -> Result<(), Box<dyn Erro
     let run_result = (|| -> Result<(), Box<dyn Error>> {
         let (analysis_tx, analysis_rx) = mpsc::channel::<AnalysisEvent>();
         let mut app = App::default();
+        let mut last_stream_poll = Instant::now();
 
         if let Some(ticker) = initial_ticker {
-            fetch_and_store_quote(&mut app, &ticker, &analysis_tx);
+            fetch_and_store_quote(&mut app, &ticker, &analysis_tx, true);
+            last_stream_poll = Instant::now();
         } else {
             queue_model_preload(&analysis_tx);
         }
@@ -367,14 +388,21 @@ pub(crate) fn run_tui(initial_ticker: Option<String>) -> Result<(), Box<dyn Erro
             drain_analysis_events(&mut app, &analysis_rx);
             terminal.draw(|frame| draw_ui(frame, &app))?;
 
+            if let Some(ticker) = app.active_ticker.clone() {
+                if last_stream_poll.elapsed() >= YAHOO_STREAM_POLL_INTERVAL {
+                    fetch_and_store_quote(&mut app, &ticker, &analysis_tx, false);
+                    last_stream_poll = Instant::now();
+                }
+            }
+
             if !event::poll(Duration::from_millis(50))? {
                 app.input_cursor_visible = !app.input_cursor_visible;
                 continue;
             }
 
             let event = event::read()?;
-            if !controls::handle_event(&mut app, event, |app, ticker| {
-                fetch_and_store_quote(app, ticker, &analysis_tx)
+            if !controls::handle_event(&mut app, event, |app, ticker, run_analysis| {
+                fetch_and_store_quote(app, ticker, &analysis_tx, run_analysis)
             }) {
                 break;
             }

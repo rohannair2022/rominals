@@ -1,6 +1,6 @@
 use crate::api::finnhub::{FinnhubSnapshot, finnhub_dataset_titles};
 use crate::api::mlx::worker_section_titles;
-use crate::api::yahoo::Meta;
+use crate::api::yahoo::{Candle, CandleRange, Meta};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppTab {
@@ -22,12 +22,21 @@ pub(crate) struct FinnhubDatasetState {
     pub(crate) is_error: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct YahooLivePoint {
+    pub(crate) timestamp_ms: i64,
+    pub(crate) price: f64,
+}
+
 pub(crate) struct App {
     pub(crate) input: String,
     pub(crate) input_cursor_visible: bool,
     pub(crate) active_tab: AppTab,
     pub(crate) active_ticker: Option<String>,
     pub(crate) quote: Option<Meta>,
+    pub(crate) yahoo_candles: Vec<Candle>,
+    pub(crate) yahoo_live_prices: Vec<YahooLivePoint>,
+    pub(crate) yahoo_range: CandleRange,
     pub(crate) analysis_loading: bool,
     pub(crate) analysis_request_id: u64,
     pub(crate) analysis_error: Option<String>,
@@ -60,6 +69,9 @@ impl Default for App {
             active_tab: AppTab::Yahoo,
             active_ticker: None,
             quote: None,
+            yahoo_candles: Vec::new(),
+            yahoo_live_prices: Vec::new(),
+            yahoo_range: CandleRange::default(),
             analysis_loading: false,
             analysis_request_id: 0,
             analysis_error: None,
@@ -91,18 +103,56 @@ impl Default for App {
 }
 
 impl App {
+    const LIVE_WINDOW_MS: i64 = 10_000;
+
     pub(crate) fn active_tab_index(&self) -> usize {
         match self.active_tab {
             AppTab::Yahoo => 0,
-            AppTab::Mlx => 1,
-            AppTab::Finnhub => 2,
+            AppTab::Mlx | AppTab::Finnhub => 1,
         }
+    }
+
+    pub(crate) fn set_yahoo_range(&mut self, range: CandleRange) -> bool {
+        if self.yahoo_range == range {
+            return false;
+        }
+        self.yahoo_range = range;
+        true
+    }
+
+    pub(crate) fn yahoo_range_index(&self) -> usize {
+        self.yahoo_range.index()
+    }
+
+    pub(crate) fn next_yahoo_range(&mut self) -> bool {
+        self.set_yahoo_range(self.yahoo_range.next())
+    }
+
+    pub(crate) fn prev_yahoo_range(&mut self) -> bool {
+        self.set_yahoo_range(self.yahoo_range.prev())
+    }
+
+    pub(crate) fn push_yahoo_live_price(&mut self, timestamp_ms: i64, price: f64) {
+        if !price.is_finite() {
+            return;
+        }
+
+        self.yahoo_live_prices.push(YahooLivePoint {
+            timestamp_ms,
+            price,
+        });
+        self.prune_yahoo_live_prices(timestamp_ms);
+    }
+
+    pub(crate) fn prune_yahoo_live_prices(&mut self, now_ms: i64) {
+        let cutoff = now_ms.saturating_sub(Self::LIVE_WINDOW_MS);
+        self.yahoo_live_prices
+            .retain(|point| point.timestamp_ms >= cutoff);
     }
 
     pub(crate) fn set_tab_index(&mut self, index: usize) {
         self.active_tab = match index {
             0 => AppTab::Yahoo,
-            1 => AppTab::Mlx,
             _ => AppTab::Finnhub,
         };
     }
@@ -212,6 +262,6 @@ impl App {
     }
 
     fn tab_count(&self) -> usize {
-        3
+        2
     }
 }

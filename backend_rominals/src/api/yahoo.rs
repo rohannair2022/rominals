@@ -17,6 +17,21 @@ struct Chart {
 #[derive(Debug, Deserialize)]
 struct ChartResult {
     meta: Meta,
+    timestamp: Option<Vec<i64>>,
+    indicators: Option<Indicators>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Indicators {
+    quote: Option<Vec<QuoteSeries>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuoteSeries {
+    open: Option<Vec<Option<f64>>>,
+    high: Option<Vec<Option<f64>>>,
+    low: Option<Vec<Option<f64>>>,
+    close: Option<Vec<Option<f64>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,7 +40,7 @@ struct ChartApiError {
     description: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Meta {
     pub symbol: String,
@@ -40,6 +55,92 @@ pub struct Meta {
     pub regular_market_volume: Option<i64>,
     pub fifty_two_week_high: Option<f64>,
     pub fifty_two_week_low: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candle {
+    pub timestamp: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandleRange {
+    Day,
+    Week,
+    Month,
+    Year,
+    All,
+}
+
+impl CandleRange {
+    pub const ORDERED: [Self; 5] = [Self::Day, Self::Week, Self::Month, Self::Year, Self::All];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Day => 0,
+            Self::Week => 1,
+            Self::Month => 2,
+            Self::Year => 3,
+            Self::All => 4,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ORDERED.get(index).copied().unwrap_or(Self::Day)
+    }
+
+    pub fn next(self) -> Self {
+        Self::from_index((self.index() + 1) % Self::ORDERED.len())
+    }
+
+    pub fn prev(self) -> Self {
+        Self::from_index((self.index() + Self::ORDERED.len() - 1) % Self::ORDERED.len())
+    }
+
+    pub fn tab_label(self) -> &'static str {
+        match self {
+            Self::Day => "D",
+            Self::Week => "W",
+            Self::Month => "M",
+            Self::Year => "Y",
+            Self::All => "ALL",
+        }
+    }
+
+    pub fn title_label(self) -> &'static str {
+        match self {
+            Self::Day => "Daily",
+            Self::Week => "Weekly",
+            Self::Month => "Monthly",
+            Self::Year => "Yearly",
+            Self::All => "All",
+        }
+    }
+
+    fn yahoo_query(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Day => ("1d", "1m"),
+            Self::Week => ("1wk", "5m"),
+            Self::Month => ("1mo", "15m"),
+            Self::Year => ("1y", "1d"),
+            Self::All => ("max", "1wk"),
+        }
+    }
+}
+
+impl Default for CandleRange {
+    fn default() -> Self {
+        Self::Day
+    }
+}
+
+#[derive(Debug)]
+pub struct QuoteSnapshot {
+    pub meta: Meta,
+    pub candles: Vec<Candle>,
 }
 
 fn format_opt_f64(value: Option<f64>) -> String {
@@ -189,8 +290,12 @@ Inference cues (soft assumptions, not hard facts):\n\
     )
 }
 
-pub fn fetch_quote(ticker: &str) -> Result<Meta, Box<dyn Error>> {
+pub fn fetch_quote_snapshot(
+    ticker: &str,
+    candle_range: CandleRange,
+) -> Result<QuoteSnapshot, Box<dyn Error>> {
     let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{ticker}");
+    let (range, interval) = candle_range.yahoo_query();
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (rust-yfinance/0.1)")
@@ -198,7 +303,10 @@ pub fn fetch_quote(ticker: &str) -> Result<Meta, Box<dyn Error>> {
         .connect_timeout(Duration::from_secs(5))
         .build()?;
 
-    let resp = client.get(&url).send()?;
+    let resp = client
+        .get(&url)
+        .query(&[("range", range), ("interval", interval)])
+        .send()?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -212,11 +320,10 @@ pub fn fetch_quote(ticker: &str) -> Result<Meta, Box<dyn Error>> {
     }
 
     let body: ChartResponse = resp.json()?;
-    let meta = extract_meta(body, ticker)?;
-    Ok(meta)
+    extract_snapshot(body, ticker).map_err(Into::into)
 }
 
-fn extract_meta(body: ChartResponse, ticker: &str) -> Result<Meta, io::Error> {
+fn extract_snapshot(body: ChartResponse, ticker: &str) -> Result<QuoteSnapshot, io::Error> {
     let Chart { result, error } = body.chart;
 
     if let Some(api_error) = error {
@@ -245,7 +352,62 @@ fn extract_meta(body: ChartResponse, ticker: &str) -> Result<Meta, io::Error> {
             )
         })?;
 
-    Ok(first_result.meta)
+    let candles = extract_candles(&first_result);
+
+    Ok(QuoteSnapshot {
+        meta: first_result.meta,
+        candles,
+    })
+}
+
+fn extract_candles(result: &ChartResult) -> Vec<Candle> {
+    let Some(timestamps) = result.timestamp.as_ref() else {
+        return Vec::new();
+    };
+    let Some(series) = result
+        .indicators
+        .as_ref()
+        .and_then(|indicators| indicators.quote.as_ref())
+        .and_then(|quotes| quotes.first())
+    else {
+        return Vec::new();
+    };
+
+    let mut candles = Vec::with_capacity(timestamps.len());
+
+    for (index, timestamp) in timestamps.iter().copied().enumerate() {
+        let Some(open) = series_value(&series.open, index) else {
+            continue;
+        };
+        let Some(high) = series_value(&series.high, index) else {
+            continue;
+        };
+        let Some(low) = series_value(&series.low, index) else {
+            continue;
+        };
+        let Some(close) = series_value(&series.close, index) else {
+            continue;
+        };
+
+        if high < low {
+            continue;
+        }
+
+        candles.push(Candle {
+            timestamp,
+            open,
+            high,
+            low,
+            close,
+        });
+    }
+
+    candles
+}
+
+fn series_value(series: &Option<Vec<Option<f64>>>, index: usize) -> Option<f64> {
+    let value = series.as_ref()?.get(index).copied().flatten()?;
+    if value.is_finite() { Some(value) } else { None }
 }
 
 #[cfg(test)]
@@ -273,13 +435,16 @@ mod tests {
             chart: Chart {
                 result: Some(vec![ChartResult {
                     meta: sample_meta("AAPL"),
+                    timestamp: None,
+                    indicators: None,
                 }]),
                 error: None,
             },
         };
 
-        let meta = extract_meta(body, "AAPL").unwrap();
-        assert_eq!(meta.symbol, "AAPL");
+        let snapshot = extract_snapshot(body, "AAPL").unwrap();
+        assert_eq!(snapshot.meta.symbol, "AAPL");
+        assert!(snapshot.candles.is_empty());
     }
 
     #[test]
@@ -294,10 +459,44 @@ mod tests {
             },
         };
 
-        let err = extract_meta(body, "INVALID").unwrap_err();
+        let err = extract_snapshot(body, "INVALID").unwrap_err();
         assert_eq!(
             err.to_string(),
             "Yahoo API error for INVALID [Not Found]: No data found"
+        );
+    }
+
+    #[test]
+    fn extract_snapshot_parses_ohlc_candles() {
+        let body = ChartResponse {
+            chart: Chart {
+                result: Some(vec![ChartResult {
+                    meta: sample_meta("AAPL"),
+                    timestamp: Some(vec![1, 2, 3]),
+                    indicators: Some(Indicators {
+                        quote: Some(vec![QuoteSeries {
+                            open: Some(vec![Some(10.0), Some(12.0), None]),
+                            high: Some(vec![Some(11.0), Some(13.0), Some(15.0)]),
+                            low: Some(vec![Some(9.5), Some(11.5), Some(14.0)]),
+                            close: Some(vec![Some(10.5), Some(12.5), Some(14.5)]),
+                        }]),
+                    }),
+                }]),
+                error: None,
+            },
+        };
+
+        let snapshot = extract_snapshot(body, "AAPL").unwrap();
+        assert_eq!(snapshot.candles.len(), 2);
+        assert_eq!(
+            snapshot.candles[0],
+            Candle {
+                timestamp: 1,
+                open: 10.0,
+                high: 11.0,
+                low: 9.5,
+                close: 10.5
+            }
         );
     }
 

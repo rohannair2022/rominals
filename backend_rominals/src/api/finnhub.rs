@@ -15,11 +15,10 @@ const DEFAULT_LINK_CONTEXT_MAX_CHARS_PER_URL: usize = 700;
 const DEFAULT_LINK_CONTEXT_MAX_TOTAL_CHARS_PER_SCOPE: usize = 1_400;
 const DEFAULT_LINK_CONTEXT_TIMEOUT_SECS: u64 = 6;
 const DEFAULT_LINK_CONTEXT_MAX_FETCH_BYTES: usize = 90_000;
-const DATASET_DEFS: [(&str, &str); 13] = [
+const DATASET_DEFS: [(&str, &str); 12] = [
     ("stock_profile", "Stock Profile"),
     ("news", "Market News (General)"),
     ("company_news", "Company News"),
-    ("market_sentiment", "Market Sentiment"),
     ("peers", "Peers"),
     ("insider_transactions", "Insider Transactions"),
     ("insider_sentiments", "Insider Sentiment"),
@@ -113,10 +112,6 @@ impl FinnhubClient {
         to: &str,
     ) -> Result<Value, Box<dyn Error>> {
         self.get_json("company-news", symbol_with_date_params(symbol, from, to)?)
-    }
-
-    pub fn market_sentiment(&self, symbol: &str) -> Result<Value, Box<dyn Error>> {
-        self.get_json("news-sentiment", symbol_only_params(symbol)?)
     }
 
     pub fn peers(&self, symbol: &str) -> Result<Value, Box<dyn Error>> {
@@ -283,32 +278,29 @@ pub fn fetch_finnhub_snapshot(symbol: &str) -> Result<FinnhubSnapshot, Box<dyn E
     push_dataset(&mut datasets, DATASET_DEFS[2].1, || {
         client.company_news(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[3].1, || {
-        client.market_sentiment(&symbol)
-    });
-    push_dataset(&mut datasets, DATASET_DEFS[4].1, || client.peers(&symbol));
-    push_dataset(&mut datasets, DATASET_DEFS[5].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[3].1, || client.peers(&symbol));
+    push_dataset(&mut datasets, DATASET_DEFS[4].1, || {
         client.insider_transactions(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[6].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[5].1, || {
         client.insider_sentiments(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[7].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[6].1, || {
         client.financials_reported(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[8].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[7].1, || {
         client.sec_filings(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[9].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[8].1, || {
         client.earnings_surprises(&symbol)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[10].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[9].1, || {
         client.uspto_patents(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[11].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[10].1, || {
         client.stock_lobbying(&symbol, &from, &to)
     });
-    push_dataset(&mut datasets, DATASET_DEFS[12].1, || {
+    push_dataset(&mut datasets, DATASET_DEFS[11].1, || {
         client.stock_usa_spending(&symbol, &from, &to)
     });
 
@@ -407,7 +399,7 @@ where
 }
 
 fn is_macro_dataset(title: &str) -> bool {
-    matches!(title, "Market News (General)" | "Market Sentiment")
+    matches!(title, "Market News (General)")
 }
 
 fn is_micro_dataset(title: &str) -> bool {

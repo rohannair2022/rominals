@@ -1,4 +1,5 @@
 use super::state::{App, AppTab};
+use crate::api::yahoo::CandleRange;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 const INVALID_TICKER_ERROR: &str = "Ticker can only include letters, numbers, '.', '-', and '^'.";
@@ -19,7 +20,7 @@ pub(crate) fn normalize_ticker(input: &str) -> Option<String> {
 
 pub(super) fn handle_event<F>(app: &mut App, event: Event, fetch_quote: F) -> bool
 where
-    F: Fn(&mut App, &str),
+    F: Fn(&mut App, &str, bool),
 {
     if let Event::Key(key_event) = event {
         return handle_key_event(app, key_event, fetch_quote);
@@ -29,7 +30,7 @@ where
 
 fn handle_key_event<F>(app: &mut App, key_event: KeyEvent, fetch_quote: F) -> bool
 where
-    F: Fn(&mut App, &str),
+    F: Fn(&mut App, &str, bool),
 {
     if key_event.kind != KeyEventKind::Press {
         return true;
@@ -43,14 +44,14 @@ where
         (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => false,
         (KeyCode::Char('r' | 'R'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(ticker) = app.active_ticker.clone() {
-                fetch_quote(app, &ticker);
+                fetch_quote(app, &ticker, true);
             }
             true
         }
         (KeyCode::Enter, _) => {
             if let Some(ticker) = normalize_ticker(&app.input) {
                 app.input.clear();
-                fetch_quote(app, &ticker);
+                fetch_quote(app, &ticker, true);
             } else {
                 app.error = Some(INVALID_TICKER_ERROR.to_string());
             }
@@ -85,14 +86,20 @@ where
             true
         }
         (KeyCode::F(3), _) => {
-            app.set_tab_index(2);
+            app.set_tab_index(1);
             true
         }
         (KeyCode::Char('['), _) => {
             match app.active_tab {
                 AppTab::Mlx => app.prev_mlx_section(),
                 AppTab::Finnhub => app.prev_finnhub_dataset(),
-                AppTab::Yahoo => {}
+                AppTab::Yahoo => {
+                    if app.prev_yahoo_range() {
+                        if let Some(ticker) = app.active_ticker.clone() {
+                            fetch_quote(app, &ticker, false);
+                        }
+                    }
+                }
             }
             true
         }
@@ -100,7 +107,53 @@ where
             match app.active_tab {
                 AppTab::Mlx => app.next_mlx_section(),
                 AppTab::Finnhub => app.next_finnhub_dataset(),
-                AppTab::Yahoo => {}
+                AppTab::Yahoo => {
+                    if app.next_yahoo_range() {
+                        if let Some(ticker) = app.active_ticker.clone() {
+                            fetch_quote(app, &ticker, false);
+                        }
+                    }
+                }
+            }
+            true
+        }
+        (KeyCode::Char('d' | 'D'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Day) {
+                if let Some(ticker) = app.active_ticker.clone() {
+                    fetch_quote(app, &ticker, false);
+                }
+            }
+            true
+        }
+        (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Week) {
+                if let Some(ticker) = app.active_ticker.clone() {
+                    fetch_quote(app, &ticker, false);
+                }
+            }
+            true
+        }
+        (KeyCode::Char('m' | 'M'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Month) {
+                if let Some(ticker) = app.active_ticker.clone() {
+                    fetch_quote(app, &ticker, false);
+                }
+            }
+            true
+        }
+        (KeyCode::Char('y' | 'Y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::Year) {
+                if let Some(ticker) = app.active_ticker.clone() {
+                    fetch_quote(app, &ticker, false);
+                }
+            }
+            true
+        }
+        (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.active_tab == AppTab::Yahoo && app.set_yahoo_range(CandleRange::All) {
+                if let Some(ticker) = app.active_ticker.clone() {
+                    fetch_quote(app, &ticker, false);
+                }
             }
             true
         }
@@ -239,7 +292,7 @@ mod tests {
         let mut app = App::default();
         let event = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
 
-        let keep_running = handle_event(&mut app, event, |_app, _ticker| {});
+        let keep_running = handle_event(&mut app, event, |_app, _ticker, _run_analysis| {});
 
         assert!(keep_running);
         assert_eq!(app.input, "Q");
@@ -250,7 +303,7 @@ mod tests {
         let mut app = App::default();
         let event = Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
 
-        let keep_running = handle_event(&mut app, event, |_app, _ticker| {});
+        let keep_running = handle_event(&mut app, event, |_app, _ticker, _run_analysis| {});
 
         assert!(keep_running);
         assert_eq!(app.input, "R");
@@ -261,7 +314,7 @@ mod tests {
         let mut app = App::default();
         let event = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        let keep_running = handle_event(&mut app, event, |_app, _ticker| {});
+        let keep_running = handle_event(&mut app, event, |_app, _ticker, _run_analysis| {});
 
         assert!(!keep_running);
     }
@@ -273,9 +326,10 @@ mod tests {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         let called = Cell::new(false);
 
-        let keep_running = handle_event(&mut app, event, |_app, ticker| {
+        let keep_running = handle_event(&mut app, event, |_app, ticker, run_analysis| {
             called.set(true);
             assert_eq!(ticker, "MSFT");
+            assert!(run_analysis);
         });
 
         assert!(keep_running);
@@ -293,9 +347,17 @@ mod tests {
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let up = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
-        assert!(handle_event(&mut app, down, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            down,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.mlx_sections[0].scroll, 3);
-        assert!(handle_event(&mut app, up, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            up,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.mlx_sections[0].scroll, 2);
     }
 
@@ -308,13 +370,29 @@ mod tests {
         let f3 = Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        assert!(handle_event(&mut app, right, |_app, _ticker| {}));
-        assert_eq!(app.active_tab, AppTab::Mlx);
-        assert!(handle_event(&mut app, f2, |_app, _ticker| {}));
-        assert_eq!(app.active_tab, AppTab::Mlx);
-        assert!(handle_event(&mut app, f3, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            right,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.active_tab, AppTab::Finnhub);
-        assert!(handle_event(&mut app, tab, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            f2,
+            |_app, _ticker, _run_analysis| {}
+        ));
+        assert_eq!(app.active_tab, AppTab::Finnhub);
+        assert!(handle_event(
+            &mut app,
+            f3,
+            |_app, _ticker, _run_analysis| {}
+        ));
+        assert_eq!(app.active_tab, AppTab::Finnhub);
+        assert!(handle_event(
+            &mut app,
+            tab,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.active_tab, AppTab::Yahoo);
     }
 
@@ -325,9 +403,17 @@ mod tests {
         let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         let jump = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
 
-        assert!(handle_event(&mut app, next, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            next,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.active_mlx_section_index, 1);
-        assert!(handle_event(&mut app, jump, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            jump,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.active_mlx_section_index, 1);
     }
 
@@ -338,9 +424,78 @@ mod tests {
         let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         let jump = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
 
-        assert!(handle_event(&mut app, next, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            next,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.active_finnhub_dataset_index, 1);
-        assert!(handle_event(&mut app, jump, |_app, _ticker| {}));
+        assert!(handle_event(
+            &mut app,
+            jump,
+            |_app, _ticker, _run_analysis| {}
+        ));
         assert_eq!(app.active_finnhub_dataset_index, 1);
+    }
+
+    #[test]
+    fn handle_event_switches_yahoo_candle_range_without_analysis() {
+        let mut app = App::default();
+        app.active_tab = AppTab::Yahoo;
+        app.active_ticker = Some("AAPL".to_string());
+        let next = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let called = Cell::new(false);
+
+        assert!(handle_event(
+            &mut app,
+            next,
+            |_app, ticker, run_analysis| {
+                called.set(true);
+                assert_eq!(ticker, "AAPL");
+                assert!(!run_analysis);
+            }
+        ));
+        assert!(called.get());
+        assert_eq!(app.yahoo_range, CandleRange::Week);
+    }
+
+    #[test]
+    fn handle_event_keeps_typing_letters_for_ticker_input() {
+        let mut app = App::default();
+        app.active_tab = AppTab::Yahoo;
+        app.active_ticker = Some("MSFT".to_string());
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let called = Cell::new(false);
+
+        assert!(handle_event(
+            &mut app,
+            event,
+            |_app, _ticker, _run_analysis| {
+                called.set(true);
+            }
+        ));
+        assert_eq!(app.input, "A");
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn handle_event_switches_yahoo_range_with_ctrl_hotkey() {
+        let mut app = App::default();
+        app.active_tab = AppTab::Yahoo;
+        app.active_ticker = Some("AAPL".to_string());
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let called = Cell::new(false);
+
+        assert!(handle_event(
+            &mut app,
+            event,
+            |_app, ticker, run_analysis| {
+                called.set(true);
+                assert_eq!(ticker, "AAPL");
+                assert!(!run_analysis);
+            }
+        ));
+        assert!(called.get());
+        assert_eq!(app.yahoo_range, CandleRange::Week);
     }
 }
