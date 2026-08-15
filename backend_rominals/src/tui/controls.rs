@@ -137,6 +137,15 @@ where
             }
             true
         }
+        (KeyCode::Char('e' | 'E'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.active_ticker.is_some() {
+                app.report_requested = true;
+                app.error = None;
+            } else {
+                app.error = Some("Load a ticker before sending a report email.".to_string());
+            }
+            true
+        }
         (KeyCode::Char(c @ '1'..='9'), _) => {
             let index = (c as usize) - ('1' as usize);
             if index < app.finnhub_datasets.len() {
@@ -406,5 +415,19 @@ mod tests {
         ));
         assert!(called.get());
         assert_eq!(app.yahoo_range, CandleRange::Week);
+    }
+
+    #[test]
+    fn handle_event_marks_report_request_on_ctrl_e() {
+        let mut app = App::default();
+        app.active_ticker = Some("AAPL".to_string());
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+
+        assert!(handle_event(
+            &mut app,
+            event,
+            |_app, _ticker, _run_analysis| {}
+        ));
+        assert!(app.report_requested);
     }
 }

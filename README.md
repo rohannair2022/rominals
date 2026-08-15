@@ -5,6 +5,10 @@ Rominals is a **Rust terminal app** for stock research. It combines:
 - multi-endpoint Finnhub datasets,
 - local MLX worker analysis for macro and micro outlook.
 
+## Screenshot
+
+![Rominals terminal UI screenshot](docs/images/rominals-ui.png)
+
 ## Architecture
 
 ```mermaid
@@ -54,10 +58,15 @@ export ROMINALS_FINNHUB_API_KEY=your_finnhub_key_here
 export ROMINALS_MLX_MODEL=mlx-community/Qwen3.5-4B-MLX-4bit
 export ROMINALS_MLX_PARALLEL_WORKERS=2
 export ROMINALS_COMP_TICKER=MSFT
+export ROMINALS_GMAIL_USER=your_gmail@gmail.com
+export ROMINALS_GMAIL_APP_PASSWORD=your_16_char_app_password
+export ROMINALS_REPORT_TO=optional_destination@gmail.com
 ```
 
 - `ROMINALS_FINNHUB_API_KEY` (or `FINNHUB_API_KEY`) enables Finnhub.
 - `ROMINALS_COMP_TICKER` is optional and adds comparison context.
+- `ROMINALS_GMAIL_USER` and `ROMINALS_GMAIL_APP_PASSWORD` enable Gmail SMTP report delivery.
+- `ROMINALS_REPORT_TO` is optional; if unset, reports are sent to `ROMINALS_GMAIL_USER`.
 
 ## Controls
 
@@ -66,6 +75,7 @@ export ROMINALS_COMP_TICKER=MSFT
 - `Tab` / `Shift+Tab` / `←` / `→` / `[` / `]`: cycle Finnhub datasets in the unified market view
 - `1-9`: jump directly to a Finnhub dataset
 - `Ctrl+D` / `Ctrl+W` / `Ctrl+M` / `Ctrl+Y` / `Ctrl+A`: change Yahoo candle range
+- `Ctrl+E`: generate a clean 300-400 word AI report with formatted data snapshot and email it via Gmail
 - `Esc` / `Ctrl+C` / `Ctrl+Q`: quit
 
 ## Project map

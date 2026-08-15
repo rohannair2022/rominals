@@ -39,6 +39,14 @@ pub(crate) struct App {
     pub(crate) finnhub_datasets: Vec<FinnhubDatasetState>,
     pub(crate) active_finnhub_dataset_index: usize,
     pub(crate) comparison_ticker: Option<String>,
+    pub(crate) report_loading: bool,
+    pub(crate) report_request_id: u64,
+    pub(crate) report_requested: bool,
+    pub(crate) report_status: Option<String>,
+    pub(crate) report_preview: Option<String>,
+    pub(crate) report_last_sent_to: Option<String>,
+    pub(crate) report_last_subject: Option<String>,
+    pub(crate) report_last_sent_at: Option<String>,
     pub(crate) error: Option<String>,
 }
 
@@ -88,6 +96,14 @@ impl Default for App {
                 .collect(),
             active_finnhub_dataset_index: 0,
             comparison_ticker,
+            report_loading: false,
+            report_request_id: 0,
+            report_requested: false,
+            report_status: None,
+            report_preview: None,
+            report_last_sent_to: None,
+            report_last_subject: None,
+            report_last_sent_at: None,
             error: None,
         }
     }

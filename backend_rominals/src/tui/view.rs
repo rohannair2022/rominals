@@ -351,6 +351,21 @@ fn padded_bounds(values: &[f64]) -> Option<(f64, f64)> {
     Some((min - pad, max + pad))
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max_chars).collect();
+    format!(
+        "{clipped}\n...[truncated {} chars]",
+        char_count.saturating_sub(max_chars)
+    )
+}
+
 fn render_yahoo_tab(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let yahoo_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -678,6 +693,63 @@ fn render_market_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect)
     render_finnhub_tab(frame, app, hub_chunks[1]);
 }
 
+fn render_report_panel(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let status_text = app
+        .report_status
+        .as_deref()
+        .unwrap_or("Idle. Press Ctrl+E to generate an AI report and send it to Gmail.");
+    let recipient = app
+        .report_last_sent_to
+        .clone()
+        .or_else(|| std::env::var("ROMINALS_REPORT_TO").ok())
+        .or_else(|| std::env::var("ROMINALS_GMAIL_USER").ok())
+        .unwrap_or_else(|| "n/a".to_string());
+    let subject = app.report_last_subject.as_deref().unwrap_or("n/a");
+    let sent_at = app.report_last_sent_at.as_deref().unwrap_or("n/a");
+    let preview = app
+        .report_preview
+        .as_deref()
+        .map(|text| truncate_chars(text, 3_000))
+        .unwrap_or_else(|| "No preview generated yet.".to_string());
+
+    let mut lines = vec![
+        Line::from("Action: Ctrl+E to summarize and email report"),
+        Line::from(format!("Recipient: {recipient}")),
+        Line::from(format!("Last subject: {subject}")),
+        Line::from(format!("Last sent (UTC): {sent_at}")),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Delivery status:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(status_text),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Latest preview:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    lines.extend(preview.lines().map(Line::from));
+
+    let panel_style = if app.report_loading {
+        Style::default().fg(Color::Yellow)
+    } else if status_text.contains("failed") || status_text.contains("error") {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+
+    let panel = Paragraph::new(lines)
+        .style(panel_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Report Mailer"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
 pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     let outer_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -697,7 +769,7 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Enter fetch  Ctrl+R refresh  Yahoo auto-stream ~2s  Tab/Shift+Tab/←/→/[ ] cycle Finnhub dataset  1-9 jump dataset  Ctrl+D/W/M/Y/A Yahoo range  Esc quit",
+            "  |  Enter fetch  Ctrl+R refresh  Ctrl+E email AI report  Yahoo auto-stream ~2s  Tab/Shift+Tab/←/→/[ ] cycle Finnhub dataset  1-9 jump dataset  Ctrl+D/W/M/Y/A Yahoo range  Esc quit",
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Header"));
@@ -726,7 +798,12 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
     .wrap(Wrap { trim: true });
     frame.render_widget(input, outer_chunks[1]);
 
-    render_market_view(frame, app, outer_chunks[2]);
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(outer_chunks[2]);
+    render_market_view(frame, app, center_chunks[0]);
+    render_report_panel(frame, app, center_chunks[1]);
 
     let status = if app.analysis_loading {
         Paragraph::new("Refreshing market data...")
@@ -771,6 +848,10 @@ pub(super) fn draw_ui(frame: &mut Frame, app: &App) {
                         "Sources  Yahoo: {yahoo_health}  |  Finnhub: {finnhub_health}"
                     )),
                     Line::from(finnhub_status),
+                    Line::from(format!(
+                        "Report mailer: {}",
+                        app.report_status.as_deref().unwrap_or("idle")
+                    )),
                 ];
                 let style = if finnhub_status.contains("unavailable") {
                     Style::default().fg(Color::Yellow)

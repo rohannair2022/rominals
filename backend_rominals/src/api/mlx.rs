@@ -13,6 +13,7 @@ const DEFAULT_MLX_MAX_TOKENS: u32 = 600;
 const DEFAULT_MLX_TEMPERATURE: f32 = 0.2;
 const DEFAULT_MLX_PARALLEL_WORKERS: usize = 2;
 const DEFAULT_MLX_ENABLE_THINKING: bool = false;
+const REPORT_MAX_TOKENS_FLOOR: u32 = 900;
 // Confirmed on your M1: 2 concurrent workers sustain ~25 tok/s each.
 const MAX_MLX_PARALLEL_WORKERS: usize = 2;
 const DEFAULT_MLX_SERVER_PORT: u16 = 8712;
@@ -136,6 +137,21 @@ where
     ensure_server_started(&config)?;
     on_status("MLX server ready and model loaded.");
     Ok(())
+}
+
+pub fn summarize_terminal_report(report_context: &str) -> Result<String, Box<dyn Error>> {
+    if report_context.trim().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Report context is empty").into());
+    }
+
+    let mut config = mlx_config_from_env();
+    config.enable_thinking = false;
+    config.max_tokens = config.max_tokens.max(REPORT_MAX_TOKENS_FLOOR);
+
+    ensure_server_started(&config)?;
+    let prompt = build_terminal_report_prompt(report_context);
+    let summary = run_mlx_generation(&config, &prompt, |_| {})?;
+    Ok(strip_generation_footer(&summary))
 }
 
 /// Stops the background `mlx_lm.server` process, if one is running. Call
@@ -427,6 +443,57 @@ Context:\n{data_context}\n\
 \n\
 Return only this section, with 5-7 bullet-like lines in plain text, max 170 words total."
     )
+}
+
+fn build_terminal_report_prompt(report_context: &str) -> String {
+    format!(
+        "You are writing the narrative section for a stock market report email.\n\
+Audience: a human user who wants clear decisions from terminal data.\n\
+\n\
+Hard requirements:\n\
+- Plain text only.\n\
+- No markdown and no bullet symbols such as *, -, #, or •.\n\
+- Do not use table pipes.\n\
+- Use the word percent instead of the percent symbol.\n\
+- Keep the narrative between 260 and 320 words.\n\
+- Never fabricate missing metrics; mark them as unknown.\n\
+\n\
+Return exactly these section labels:\n\
+TLDR\n\
+DATA POINT INSIGHTS\n\
+ACTION PLAN\n\
+CONFIDENCE AND GAPS\n\
+\n\
+Section rules:\n\
+- TLDR: 45 to 60 words.\n\
+- DATA POINT INSIGHTS: exactly 5 numbered lines.\n\
+  1. Price action versus previous close.\n\
+  2. Intraday range and volatility.\n\
+  3. Position in the 52 week range.\n\
+  4. Volume and liquidity signal.\n\
+  5. News and event signal.\n\
+  Every numbered line must include observation, implication, and one risk caveat.\n\
+- ACTION PLAN: exactly 3 concise sentences.\n\
+- CONFIDENCE AND GAPS: exactly 2 concise sentences.\n\
+\n\
+Use only the context below:\n\
+\n\
+{report_context}"
+    )
+}
+
+fn strip_generation_footer(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(start) = trimmed.rfind("\n\n[") {
+        let footer = &trimmed[start + 2..];
+        if footer.starts_with('[')
+            && footer.contains("tokens generated in")
+            && footer.ends_with("tokens/sec]")
+        {
+            return trimmed[..start].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// One event out of an OpenAI-style Server-Sent-Events stream. mlx_lm.server
@@ -747,5 +814,21 @@ mod tests {
             streamed.push_str(chunk);
         }
         assert_eq!(streamed, "first second third");
+    }
+
+    #[test]
+    fn build_terminal_report_prompt_has_required_sections() {
+        let prompt = build_terminal_report_prompt("Ticker: AAPL");
+        assert!(prompt.contains("TLDR"));
+        assert!(prompt.contains("DATA POINT INSIGHTS"));
+        assert!(prompt.contains("ACTION PLAN"));
+        assert!(prompt.contains("CONFIDENCE AND GAPS"));
+        assert!(prompt.contains("260 and 320 words"));
+    }
+
+    #[test]
+    fn strip_generation_footer_removes_token_summary_suffix() {
+        let body = "Summary body\n\n[120 tokens generated in 4.00s -- 30.0 tokens/sec]";
+        assert_eq!(strip_generation_footer(body), "Summary body");
     }
 }
