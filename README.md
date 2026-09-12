@@ -88,3 +88,25 @@ backend_rominals/src/api/finnhub.rs   finnhub client and dataset/context build
 backend_rominals/src/api/mlx.rs       mlx server lifecycle and worker pipeline
 backend_rominals/scripts/             mlx helper scripts
 ```
+
+## Verification gates (CI + local hooks)
+
+This repo includes a GitHub Actions pipeline at `.github/workflows/ci.yml` that runs on:
+- pull requests targeting `main`
+- pushes to `main`
+
+It executes:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features`
+- `cargo test --all-targets --all-features --locked`
+
+Local git hooks are also included in `.githooks/`:
+- `pre-commit`: rustfmt check before each commit
+- `pre-push`: clippy + tests when pushing `main`
+
+Enable them once per clone:
+
+```bash
+chmod +x .githooks/pre-commit .githooks/pre-push
+git config core.hooksPath .githooks
+```

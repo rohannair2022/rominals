@@ -5,7 +5,7 @@ mod view;
 use crate::api::finnhub::{FinnhubSnapshot, fetch_finnhub_snapshot};
 use crate::api::mlx::{
     WorkerSectionChunk, WorkerSectionOutput, analyze_company_workers, preload_mlx_model,
-    summarize_terminal_report,
+    shutdown_mlx_server, summarize_terminal_report,
 };
 use crate::api::report::{ReportEmailConfig, send_report_email};
 use crate::api::yahoo::{CandleRange, QuoteSnapshot, build_analysis_context, fetch_quote_snapshot};
@@ -31,6 +31,14 @@ const REPORT_DATASET_CHAR_LIMIT: usize = 700;
 const REPORT_EMAIL_MIN_WORDS: usize = 300;
 const REPORT_EMAIL_MAX_WORDS: usize = 400;
 const REPORT_PREVIEW_CHAR_LIMIT: usize = 4_000;
+
+struct MlxShutdownGuard;
+
+impl Drop for MlxShutdownGuard {
+    fn drop(&mut self) {
+        shutdown_mlx_server();
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ReportDeliveryReceipt {
@@ -876,6 +884,7 @@ fn drain_analysis_events(app: &mut App, analysis_rx: &Receiver<AnalysisEvent>) {
 }
 
 pub(crate) fn run_tui(initial_ticker: Option<String>) -> Result<(), Box<dyn Error>> {
+    let _mlx_shutdown_guard = MlxShutdownGuard;
     let mut stdout = io::stdout();
 
     terminal::enable_raw_mode()?;

@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::error::Error;
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,6 +77,7 @@ struct MlxServerHandle {
 }
 
 static MLX_SERVER: Mutex<Option<MlxServerHandle>> = Mutex::new(None);
+static MLX_SERVER_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 pub fn worker_section_titles() -> Vec<String> {
     SECTION_DEFS
@@ -158,6 +159,8 @@ pub fn summarize_terminal_report(report_context: &str) -> Result<String, Box<dyn
 /// this on graceful shutdown so you don't leave an orphaned Python process
 /// holding the model in memory after your program exits.
 pub fn shutdown_mlx_server() {
+    MLX_SERVER_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+
     if let Ok(mut guard) = MLX_SERVER.lock() {
         if let Some(mut handle) = guard.take() {
             let _ = handle.child.kill();
@@ -214,6 +217,10 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
 /// call -- from any worker thread -- just returns the already-running
 /// server's base URL immediately.
 fn ensure_server_started(config: &MlxConfig) -> Result<String, Box<dyn Error>> {
+    if MLX_SERVER_SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return Err(io::Error::other("MLX server shutdown in progress").into());
+    }
+
     let mut guard = MLX_SERVER
         .lock()
         .map_err(|_| io::Error::other("MLX server lock poisoned"))?;
@@ -239,7 +246,19 @@ fn ensure_server_started(config: &MlxConfig) -> Result<String, Box<dyn Error>> {
         .stderr(Stdio::null())
         .spawn()?;
 
-    wait_for_server_ready(&base_url)?;
+    if MLX_SERVER_SHUTTING_DOWN.load(Ordering::SeqCst) {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("MLX server shutdown in progress").into());
+    }
+
+    if let Err(err) = wait_for_server_ready(&base_url) {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
 
     *guard = Some(MlxServerHandle {
         child,
